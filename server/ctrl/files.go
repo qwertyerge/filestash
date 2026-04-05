@@ -898,7 +898,7 @@ func FileDownloader(ctx *App, res http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	var addToZipRecursive func(*App, *zip.Writer, string, string, *[]string) error
 	addToZipRecursive = func(c *App, zw *zip.Writer, backendPath string, zipRoot string, errList *[]string) (err error) {
-		if time.Now().Sub(start) > time.Duration(zip_timeout())*time.Second {
+		if time.Since(start) > time.Duration(zip_timeout())*time.Second {
 			Log.Debug("downloader::timeout zip not completed due to timeout")
 			return ErrTimeout
 		}
