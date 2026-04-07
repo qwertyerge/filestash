@@ -119,7 +119,7 @@ func Page(stuff string) string {
     <meta charset="utf-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" name="viewport">
-    <title>` + Config.Get("general.name").String() + `</title>
+    <title>` + strings.NewReplacer("{", "&#123;", "}", "&#125;").Replace(Config.Get("general.name").String()) + `</title>
     <style>
       html { background: #f2f3f5; font-size: 16px; font-family: "San Francisco","Roboto","Arial",sans-serif; height: 100%;}
       body { text-align: center; padding-top: 50px; text-align: center; margin: 0; height: 100%; box-sizing: border-box;}
