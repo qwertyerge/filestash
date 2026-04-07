@@ -36,6 +36,7 @@ func (this *Filestash) Authenticate(user, password string, storage string) error
 	for _, cookie := range resp.Cookies() {
 		if cookie.Name == "auth" {
 			this.Token = cookie.Value
+			this.Storage = storage
 			return nil
 		}
 	}

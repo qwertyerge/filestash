@@ -42,5 +42,6 @@ func (this *Filestash) NewToken(storage string, path string, formData map[string
 		return err
 	}
 	this.Token = token
+	this.Storage = storage
 	return nil
 }

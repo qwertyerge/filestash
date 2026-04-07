@@ -6,6 +6,7 @@ type Filestash struct {
 	Token    string
 	URL      string
 	Insecure bool
+	Storage  string
 }
 
 func NewClient() Filestash {
