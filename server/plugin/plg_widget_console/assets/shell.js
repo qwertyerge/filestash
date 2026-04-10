@@ -4,9 +4,9 @@ import { getSession } from "../model/session.js";
 import { all as allCommands, get as getCommand, register as registerCommand } from "./registry.js";
 
 import("./commands.js");
+
 export function init() {
-    console.log("INIT");
-    return ;
+    return;
 }
 
 class ComponentShell extends HTMLElement {
@@ -19,10 +19,6 @@ class ComponentShell extends HTMLElement {
         this.initialized = false;
         this.history = [];
         this.clear();
-    }
-
-    getCommands() {
-        return allCommands();
     }
 
     static get observedAttributes() {

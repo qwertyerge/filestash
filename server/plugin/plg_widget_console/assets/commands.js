@@ -45,3 +45,99 @@ register({
         shell.classList.add("hidden");
     },
 });
+
+// register({
+//     id: "mimetype",
+//     description: "Determine file type",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "whoami",
+//     description: "Print effective user name",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "pwd",
+//     description: "Print current/working directory",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "mkdir",
+//     description: "Make directories",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "rm",
+//     description: "Remove files or directories",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "mv",
+//     description: "Move files",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "touch",
+//     description: "Create a file",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "save",
+//     description: "Save a file",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "cd",
+//     description: "Change working directory",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "ls",
+//     description: "List directory contents",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "stat",
+//     description: "Display file info",
+//     run(shell) {
+//         // TODO
+//     },
+// });
+
+// register({
+//     id: "xdg-open",
+//     description: "Open a file",
+//     run(shell) {
+//         // TODO
+//     },
+// });
