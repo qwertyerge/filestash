@@ -29,7 +29,7 @@ class ComponentShell extends HTMLElement {
     connectedCallback() {
         if (this.innerHTML === "") {
             this.innerHTML = `
-                <div class="component_shell_handle hidden"></div>
+                <div class="component_shell_handle"></div>
                 <div class="component_shell_terminal"></div>
             `;
             this.$handle = this.querySelector(".component_shell_handle");
@@ -82,6 +82,33 @@ class ComponentShell extends HTMLElement {
         this.term.fit();
         this.term.focus();
         this.term.on("key", (key, ev) => this.onKey(key, ev));
+        this.initResize();
+    }
+
+    initResize() {
+        let startY, startHeight;
+        const onMouseMove = (ev) => {
+            this.style.height = Math.min(
+                window.innerHeight,
+                Math.max(
+                    100,
+                    startHeight + (startY - ev.clientY),
+                ),
+            ) + "px";
+            this.term.fit();
+        };
+        const onMouseUp = () => {
+            document.body.classList.remove("shell_resizing");
+            window.removeEventListener("mousemove", onMouseMove);
+            window.removeEventListener("mouseup", onMouseUp);
+        };
+        this.$handle.onmousedown = (ev) => {
+            startY = ev.clientY;
+            startHeight = this.offsetHeight;
+            document.body.classList.add("shell_resizing");
+            window.addEventListener("mousemove", onMouseMove);
+            window.addEventListener("mouseup", onMouseUp);
+        };
     }
 
     onKey(key, ev) {
