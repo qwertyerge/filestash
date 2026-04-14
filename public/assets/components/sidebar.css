@@ -53,9 +53,7 @@ body.touch-no .component_filemanager_shell .component_sidebar h3 img:hover {
     padding-right: 6px;
     margin-left: -1px;
 }
-.component_filemanager_shell .component_sidebar .component_icon
 .component_filemanager_shell .component_sidebar h3 input::placeholder {
-    text-transform: capitalize;
     color: var(--light);
 }
 .component_filemanager_shell .component_sidebar h3 input {
