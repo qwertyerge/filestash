@@ -222,6 +222,7 @@ register({
                               return (bytes / (1024 * 1024 * 1024)).toFixed(1) + "G";
                           }(size)) : `${size}`;
                           const d = (function (t) {
+                              if (t === 0) return "";
                               const dt = new Date(t);
                               const month = dt.toLocaleDateString("en-US", { month: "short" });
                               const day = String(dt.getDate()).padStart(2);
