@@ -316,6 +316,18 @@ function complete(filter) {
                 shell.replaceLine(parts.join(" "));
                 return;
             default:
+                let common = matches[0];
+                for (let i = 1; i < matches.length; i++) {
+                    while (common && !matches[i].startsWith(common)) {
+                        common = common.slice(0, -1);
+                    }
+                }
+                if (common.length > prefix.length) {
+                    const parts = shell.line.split(/\s+/);
+                    parts[parts.length - 1] = dir + common;
+                    shell.replaceLine(parts.join(" "));
+                    return
+                }
                 shell.term.write("\r\n");
                 shell.term.writeln(matches.join("  "));
                 shell.redrawLine();
