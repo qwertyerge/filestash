@@ -9,7 +9,7 @@ import {
     pipe, share, toArray, distinctUntilChanged, from, finalize,
     combineLatest, shareReplay, race, repeat, interval, merge,
     debounceTime, debounce, delay, concatMap, distinct, scan, throwError,
-    zip, animationFrames, retry, forkJoin, skip, takeUntil, timer,
+    zip, animationFrames, retry, forkJoin, skip, takeUntil, timer, withLatestFrom,
 } from "./vendor/rxjs/rxjs.min.js";
 
 import * as rxajax from "./vendor/rxjs/rxjs-ajax.min.js";
@@ -60,6 +60,7 @@ declare const rxjs: {
     takeUntil: typeof takeUntil,
     timer: typeof timer,
     pairwise: typeof pairwise,
+    withLatestFrom: typeof withLatestFrom,
 };
 
 export default rxjs;

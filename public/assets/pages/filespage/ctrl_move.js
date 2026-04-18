@@ -1,4 +1,4 @@
-import rxjs, { effect, preventDefault } from "../../lib/rx.js";
+import rxjs, { effect } from "../../lib/rx.js";
 
 import { extractPath, isDir, currentPath } from "./helper.js";
 import { mv as mv$, refresh } from "./model_files.js";
@@ -6,7 +6,7 @@ import { mv as mvVL, withVirtualLayer } from "./model_virtual_layer.js";
 
 const mv = (from, to) => withVirtualLayer(
     mv$(from, to),
-    mvVL(from, to, { crossWindow: true }),
+    mvVL(from, to),
 );
 
 export default function() {

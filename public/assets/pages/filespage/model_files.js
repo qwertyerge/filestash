@@ -155,7 +155,7 @@ export const ls = (path) => {
 export const refresh = () => {
     window.dispatchEvent(new KeyboardEvent("keydown", { keyCode: 82 }));
     bc.postMessage(null);
-}
+};
 
 export const search = (term) => ajax({
     url: withURLParams(`api/files/search?path=${encodeURIComponent(currentPath())}&q=${encodeURIComponent(term)}`),
