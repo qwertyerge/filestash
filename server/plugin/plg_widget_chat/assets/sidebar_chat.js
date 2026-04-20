@@ -102,7 +102,7 @@ function renderMessages(render, { $dom, refresh$, sidebar = true }) {
 }
 
 function renderCompose(render, { path, refresh$, $dom, onRefresh, onLoad }) {
-    const $form = createElement(`<form><input type="text" name="message" placeholder="${t("Chat")}" autocomplete="off" /></form>`);
+    const $form = createElement(`<form><input class="full-width" type="text" name="message" placeholder="${t("Chat")}" autocomplete="off" /></form>`);
 
     render($form);
     onLoad();

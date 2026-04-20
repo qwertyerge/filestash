@@ -62,6 +62,7 @@ body.touch-no .component_filemanager_shell .component_sidebar h3 img:hover {
     font-weight: bold;
     font-size: inherit;
     background: inherit;
+    padding: 0;
 }
 .component_filemanager_shell .component_sidebar [data-bind="your-files"] { margin-bottom: 30px; }
 .component_filemanager_shell .component_sidebar [data-bind] > ul { margin-left: 0px; }
