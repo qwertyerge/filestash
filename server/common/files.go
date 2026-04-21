@@ -2,9 +2,11 @@ package common
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -72,6 +74,24 @@ func SplitPath(path string) (root string, filename string) {
 		root = "/"
 	}
 	return root, filename
+}
+
+func SafeOsOpenFile(path string, flag int, perm os.FileMode) (*os.File, error) {
+	if err := safePath(path); err != nil {
+		Log.Debug("common::files safeOsOpenFile err[%s] path[%s]", err.Error(), path)
+		return nil, ErrFilesystemError
+	}
+	if runtime.GOOS == "linux" {
+		flag |= 0x20000 // O_NOFOLLOW ref:/usr/include/asm-generic/fcntl.h
+	}
+	f, err := os.OpenFile(path, flag, perm)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, ErrNotFound
+		}
+		return nil, processError(err)
+	}
+	return f, err
 }
 
 func SafeOsMkdir(path string, mode os.FileMode) error {
