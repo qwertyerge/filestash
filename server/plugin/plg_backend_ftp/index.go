@@ -268,7 +268,7 @@ func (f Ftp) Ls(path string) (files []os.FileInfo, err error) {
 
 func (f Ftp) Cat(path string) (reader io.ReadCloser, err error) {
 	f.Execute(func(client *goftp.Client) error {
-		if _, err = client.Stat(path); err != nil {
+		if _, err = f.Stat(path); err != nil {
 			return err
 		}
 		pr, pw := io.Pipe()
@@ -296,7 +296,7 @@ func (f Ftp) Stat(path string) (finfo os.FileInfo, err error) {
 	if ftpErr, ok := err.(goftp.Error); ok && ftpErr.Code() == 550 {
 		return nil, ErrNotFound
 	}
-	return nil, ErrNotImplemented
+	return nil, err
 }
 
 func (f Ftp) Mkdir(path string) (err error) {
