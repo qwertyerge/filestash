@@ -1,4 +1,5 @@
 import { register, all } from "./registry.js";
+import { toHref } from "../lib/skeleton/router.js";
 import { join } from "../lib/path.js";
 import rxjs from "../lib/rx.js";
 import ajax from "../lib/ajax.js";
@@ -25,7 +26,7 @@ register({
     description: "Show information about your instance",
     run(shell) {
         const controller = new AbortController();
-        fetch("/about", { signal: controller.signal })
+        fetch(toHref("/about"), { signal: controller.signal })
             .then((res) => res.text())
             .then((html) => {
                 const $doc = new DOMParser().parseFromString(html, "text/html");
@@ -226,7 +227,10 @@ register({
                               const dt = new Date(t);
                               const month = dt.toLocaleDateString("en-US", { month: "short" });
                               const day = String(dt.getDate()).padStart(2);
-                              const hr = dt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+                              if (new Date().getFullYear() != dt.getFullYear()) {
+                                  return `${month} ${day}  ${dt.getFullYear()}`;
+                              }
+                              const hr = dt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
                               return `${month} ${day} ${hr}`;
                           })(time);
                           return `${perm}  ${s.padStart(8)}  ${d}  ${n}`;
