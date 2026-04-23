@@ -251,7 +251,7 @@ func (f Ftp) Meta(path string) Metadata {
 }
 
 func (f Ftp) Home() (home string, err error) {
-	f.Execute(func(client *goftp.Client) error {
+	err = f.Execute(func(client *goftp.Client) error {
 		home, err = f.client.Getwd()
 		return err
 	})
@@ -259,7 +259,7 @@ func (f Ftp) Home() (home string, err error) {
 }
 
 func (f Ftp) Ls(path string) (files []os.FileInfo, err error) {
-	f.Execute(func(client *goftp.Client) error {
+	err = f.Execute(func(client *goftp.Client) error {
 		files, err = client.ReadDir(path)
 		return err
 	})
@@ -267,7 +267,7 @@ func (f Ftp) Ls(path string) (files []os.FileInfo, err error) {
 }
 
 func (f Ftp) Cat(path string) (reader io.ReadCloser, err error) {
-	f.Execute(func(client *goftp.Client) error {
+	err = f.Execute(func(client *goftp.Client) error {
 		if _, err = f.Stat(path); err != nil {
 			return err
 		}
@@ -286,25 +286,18 @@ func (f Ftp) Cat(path string) (reader io.ReadCloser, err error) {
 }
 
 func (f Ftp) Stat(path string) (finfo os.FileInfo, err error) {
-	f.Execute(func(client *goftp.Client) error {
+	err = f.Execute(func(client *goftp.Client) error {
 		finfo, err = client.Stat(path)
 		return err
 	})
-	if err == nil {
-		return finfo, err
-	}
-	if ftpErr, ok := err.(goftp.Error); ok && ftpErr.Code() == 550 {
-		return nil, ErrNotFound
-	}
-	return nil, err
+	return finfo, err
 }
 
 func (f Ftp) Mkdir(path string) (err error) {
-	f.Execute(func(client *goftp.Client) error {
+	return f.Execute(func(client *goftp.Client) error {
 		_, err = client.Mkdir(path)
 		return err
 	})
-	return err
 }
 
 func (f Ftp) Rm(path string) (err error) {
@@ -350,51 +343,57 @@ func (f Ftp) Rm(path string) (err error) {
 		err = client.Delete(_path)
 		return transformError(err)
 	}
-	f.Execute(func(client *goftp.Client) error {
-		err = recursiveDelete(client, path)
-		return err
+	return f.Execute(func(client *goftp.Client) error {
+		return recursiveDelete(client, path)
 	})
-	return err
 }
 
 func (f Ftp) Mv(from string, to string) (err error) {
-	f.Execute(func(client *goftp.Client) error {
-		err = client.Rename(from, to)
-		return err
+	return f.Execute(func(client *goftp.Client) error {
+		return client.Rename(from, to)
 	})
-	return err
 }
 
 func (f Ftp) Touch(path string) (err error) {
-	f.Execute(func(client *goftp.Client) error {
-		err = client.Store(path, strings.NewReader(""))
-		return err
+	return f.Execute(func(client *goftp.Client) error {
+		return client.Store(path, strings.NewReader(""))
 	})
-	return err
 }
 
 func (f Ftp) Save(path string, file io.Reader) (err error) {
-	f.Execute(func(client *goftp.Client) error {
-		err = client.Store(path, file)
-		return err
+	return f.Execute(func(client *goftp.Client) error {
+		return client.Store(path, file)
 	})
-	return err
 }
 
 func (f Ftp) Close() error {
 	return f.client.Close()
 }
 
-func (f Ftp) Execute(fn func(*goftp.Client) error) {
+func (f Ftp) Execute(fn func(*goftp.Client) error) error {
 	err := fn(f.client)
-	if ftpErr, ok := err.(goftp.Error); ok {
-		code := ftpErr.Code()
-		if code == 421 || (code == 0 && err.Error() == "error reading response: EOF") {
-			f.Close()
-			FtpCache.Set(f.p, nil)
-			if b, err := f.Init(f.p, &App{Context: f.ctx}); err == nil {
-				fn(b.(*Ftp).client)
-			}
+	ftpErr, ok := err.(goftp.Error)
+	if !ok {
+		return err
+	}
+	code := ftpErr.Code()
+	if code > 0 && code < 300 { // eg: bsftp rm issue
+		return nil
+	} else if code == 421 || (code == 0 && err.Error() == "error reading response: EOF") {
+		f.Close()
+		FtpCache.Set(f.p, nil)
+		b, initErr := f.Init(f.p, &App{Context: f.ctx})
+		if initErr != nil {
+			return err
+		}
+		return b.(*Ftp).Execute(fn)
+	} else if code == 550 {
+		switch strings.ToLower(ftpErr.Message()) {
+		case "permission denied":
+			return ErrPermissionDenied
+		default:
+			return ErrNotFound
 		}
 	}
+	return err
 }
