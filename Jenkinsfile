@@ -35,7 +35,7 @@ pipeline {
             steps {
                 script {
                     // smoke test
-                    docker.image("golang:1.24-bookworm").inside("--user=root") {
+                    docker.image("golang:1.26-bookworm").inside("--user=root") {
                         sh 'timeout 5 ./dist/filestash > access.log || code=$?; if [ $code -ne 124 ]; then exit $code; fi'
                         sh "cat access.log"
                         sh "cat access.log | grep -q \"\\[http\\] starting\""
@@ -50,7 +50,7 @@ pipeline {
                         // sh "cd public && npm run test"
                     }
                     // test backend
-                    docker.image("golang:1.24-bookworm").inside("--user=root") {
+                    docker.image("golang:1.26-bookworm").inside("--user=root") {
                         sh "cp ./test/assets/* /tmp/"
                         sh "go generate ./test/unit_go/..."
                         sh "go get ./..."
