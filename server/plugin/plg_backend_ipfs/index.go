@@ -18,7 +18,8 @@ func init() {
 }
 
 type Ipfs struct {
-	url string
+	url    string
+	client *http.Client
 }
 
 func (this Ipfs) Init(params map[string]string, app *App) (IBackend, error) {
@@ -30,6 +31,7 @@ func (this Ipfs) Init(params map[string]string, app *App) (IBackend, error) {
 	if _, err := this.Stat("/"); err != nil {
 		return nil, err
 	}
+	this.client = HTTPClient()
 	return &this, nil
 }
 
@@ -109,7 +111,7 @@ func (this Ipfs) Cat(path string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := HTTPClient.Do(req)
+	resp, err := this.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +161,7 @@ func (this Ipfs) Save(path string, content io.Reader) error {
 		return err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	resp, err := HTTPClient.Do(req)
+	resp, err := this.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -183,7 +185,7 @@ func (this Ipfs) query(cmd string, response any) error {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := HTTPClient.Do(req)
+	resp, err := this.client.Do(req)
 	if err != nil {
 		return err
 	}
