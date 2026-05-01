@@ -176,7 +176,7 @@ func init() {
 		can_print()
 	})
 
-	Hooks.Register.HttpEndpoint(func(r *mux.Router, app *App) error {
+	Hooks.Register.HttpEndpoint(func(r *mux.Router) error {
 		oods := r.PathPrefix("/onlyoffice").Subrouter()
 		oods.PathPrefix("/static/").HandlerFunc(StaticHandler).Methods("GET", "POST")
 		oods.HandleFunc("/event", OnlyOfficeEventHandler).Methods("POST")
