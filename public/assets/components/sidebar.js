@@ -1,5 +1,5 @@
 import { createElement, createRender, onDestroy } from "../lib/skeleton/index.js";
-import rxjs, { effect, onClick } from "../lib/rx.js";
+import rxjs, { effect, onClick, preventDefault } from "../lib/rx.js";
 import { qs } from "../lib/dom.js";
 import { settingsGet, settingsSave } from "../lib/store.js";
 import { loadCSS } from "../helpers/loader.js";
@@ -95,16 +95,17 @@ const withResize = (function() {
     return ($sidebar) => {
         const $resize = createElement(`<div class="resizer"></div>`);
         effect(rxjs.fromEvent($resize, "mousedown").pipe(
+            preventDefault(),
             rxjs.mergeMap((e0) => rxjs.fromEvent(document, "mousemove").pipe(
                 rxjs.takeUntil(rxjs.fromEvent(document, "mouseup")),
                 rxjs.startWith(e0),
                 rxjs.pairwise(),
                 rxjs.map(([prevX, currX]) => currX.clientX - prevX.clientX),
-                rxjs.scan((width, delta) => width + delta, $sidebar.clientWidth),
+                rxjs.scan((width, delta) => width + delta, $sidebar.offsetWidth),
             )),
             rxjs.startWith(memory),
             rxjs.filter((w) => !!w),
-            rxjs.map((w) => Math.min(Math.max(w, 250), 350)),
+            rxjs.map((w) => Math.min(Math.max(w, 250), 400)),
             rxjs.tap((w) => {
                 $sidebar.style.width = `${w}px`;
                 memory = w;
