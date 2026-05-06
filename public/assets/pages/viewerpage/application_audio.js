@@ -1,6 +1,7 @@
 import { createElement } from "../../lib/skeleton/index.js";
 import rxjs, { effect, onClick } from "../../lib/rx.js";
 import { qs, safe } from "../../lib/dom.js";
+import { ApplicationError } from "../../lib/error.js";
 import { onDestroy } from "../../lib/skeleton/lifecycle.js";
 import { loadCSS, loadJS } from "../../helpers/loader.js";
 import { settings_get, settings_put } from "../../lib/settings.js";
@@ -142,21 +143,21 @@ export default function(render, { getFilename, getDownloadUrl }) {
             height: 200,
             barWidth: 1,
         }))),
-        rxjs.tap((wavesurfer) => {
+        rxjs.shareReplay(1),
+    );
+    effect(setup$.pipe(
+        rxjs.mergeMap((wavesurfer) => new Promise((resolve, reject) => {
             wavesurfer.load(getDownloadUrl());
-            wavesurfer.on("error", (err) => {
-                throw new Error(err);
-            });
+            wavesurfer.on("error", (err) => reject(new ApplicationError(err)));
             wavesurfer.on("ready", () => {
                 $control.main.classList.remove("hidden");
                 qs($control.main, "#totalDuration").textContent = formatTimecode(wavesurfer.getDuration());
+                resolve(null);
             });
             onDestroy(() => wavesurfer.destroy());
-        }),
+        })),
         rxjs.catchError(ctrlError()),
-        rxjs.shareReplay(1),
-    );
-    effect(setup$);
+    ));
 
     // feature2: loading animation
     effect(setup$.pipe(
