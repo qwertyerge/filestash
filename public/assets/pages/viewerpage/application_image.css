@@ -173,5 +173,5 @@ body:not(.dark-mode) .component_imageviewer .component_image_container .fullscre
     margin-right: 5px;
 }
 .component_imageviewer .images_aside .meta_key .value {
-    color: var(--light);
+    opacity: 0.75;
 }
