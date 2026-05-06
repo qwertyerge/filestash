@@ -198,24 +198,24 @@ func (this *azureFilecat) Close() error {
 }
 
 func (this AzureBlob) Stat(path string) (os.FileInfo, error) {
+	f := File{
+		FName: filepath.Base(path),
+		FTime: -1,
+	}
 	ap := this.path(path)
 	props, err := this.client.ServiceClient().NewContainerClient(ap.containerName).NewBlockBlobClient(ap.blobName).GetProperties(this.ctx, nil)
-	if err == nil {
-		if props.ContentLength == nil || props.LastModified == nil {
-			return nil, ErrNotValid
+	if err != nil {
+		f.FType = "directory"
+		return f, nil
+	} else if props.ContentLength != nil && props.LastModified != nil {
+		f.FSize = *props.ContentLength
+		f.FTime = (*props.LastModified).Unix()
+		if v, ok := props.Metadata["Hdi_isfolder"]; ok && v != nil && *v == "true" {
+			f.FType = "directory"
 		}
-		return File{
-			FName: filepath.Base(path),
-			FSize: *props.ContentLength,
-			FTime: (*props.LastModified).Unix(),
-		}, nil
-		return nil, err
+		return f, nil
 	}
-	return File{
-		FName: filepath.Base(path),
-		FType: "directory",
-		FTime: -1,
-	}, nil
+	return nil, ErrNotValid
 }
 
 func (this *AzureBlob) Mkdir(path string) error {
