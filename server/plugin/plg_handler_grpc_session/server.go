@@ -19,6 +19,7 @@ import (
 var (
 	sidecarGracefulStopTimeout    = 5 * time.Second
 	sidecarSessionShutdownTimeout = 250 * time.Millisecond
+	sidecarSessionJanitorInterval = time.Minute
 )
 
 type sidecarTLSFiles struct {
@@ -33,8 +34,9 @@ type sidecarRuntime struct {
 	sessions *sessionManager
 	cancel   context.CancelFunc
 
-	serveDone chan struct{}
-	stopOnce  sync.Once
+	serveDone   chan struct{}
+	janitorDone chan struct{}
+	stopOnce    sync.Once
 }
 
 func loadMTLSConfig(files sidecarTLSFiles) (*tls.Config, error) {
@@ -99,6 +101,7 @@ func startSidecarServer(parent context.Context) (*sidecarRuntime, error) {
 		cancel:    cancel,
 		serveDone: make(chan struct{}),
 	}
+	runtime.startSessionJanitor(ctx)
 	go runtime.serve()
 	go func() {
 		<-ctx.Done()
@@ -126,6 +129,7 @@ func (r *sidecarRuntime) stop() {
 		if r.cancel != nil {
 			r.cancel()
 		}
+		r.waitForJanitor()
 		sessions := r.beginSessionShutdown()
 		if r.server != nil {
 			r.stopServer()
@@ -138,6 +142,41 @@ func (r *sidecarRuntime) stop() {
 		}
 		r.finishSessionShutdown(sessions)
 	})
+}
+
+func (r *sidecarRuntime) startSessionJanitor(ctx context.Context) {
+	if r == nil || r.sessions == nil || ctx == nil {
+		return
+	}
+	interval := sidecarSessionJanitorInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	done := make(chan struct{})
+	r.janitorDone = done
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.sessions.scanExpiredSessions()
+			}
+		}
+	}()
+}
+
+func (r *sidecarRuntime) waitForJanitor() {
+	if r == nil || r.janitorDone == nil {
+		return
+	}
+	select {
+	case <-r.janitorDone:
+	case <-time.After(sidecarSessionShutdownTimeout):
+	}
 }
 
 func (r *sidecarRuntime) stopServer() {

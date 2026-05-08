@@ -437,6 +437,64 @@ func TestOpenPolicyClampsReadWriteRequestToReadAndLease(t *testing.T) {
 	}
 }
 
+func TestOpenAppliesCachedGlobalDefaultLeaseWhenPolicyOmitsDurations(t *testing.T) {
+	oldDefaultLease := PluginDefaultLeaseSeconds
+	oldDefaultIdle := PluginDefaultIdleTimeoutSeconds
+	oldDefaultMaxLifetime := PluginDefaultMaxLifetimeSeconds
+	defaultCalls := 0
+	PluginDefaultLeaseSeconds = func() int {
+		defaultCalls++
+		return 600
+	}
+	PluginDefaultIdleTimeoutSeconds = func() int {
+		defaultCalls++
+		return 120
+	}
+	PluginDefaultMaxLifetimeSeconds = func() int {
+		defaultCalls++
+		return 1800
+	}
+	t.Cleanup(func() {
+		PluginDefaultLeaseSeconds = oldDefaultLease
+		PluginDefaultIdleTimeoutSeconds = oldDefaultIdle
+		PluginDefaultMaxLifetimeSeconds = oldDefaultMaxLifetime
+	})
+
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	sessions := newSessionManager(sessionManagerOptions{
+		now: func() time.Time { return openTestNow },
+		id:  func() (string, error) { return "open-s1", nil },
+	})
+	svc, err := newSidecarService(sessions, &policyEngine{clients: []clientPolicy{{
+		Identity:    "client-a",
+		AccessModes: []string{"read"},
+		Lease:       leaseJSON{Renewable: true},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultCalls != 3 {
+		t.Fatalf("default lease calls=%d", defaultCalls)
+	}
+	PluginDefaultLeaseSeconds = func() int { panic("PluginDefaultLeaseSeconds called after service construction") }
+	PluginDefaultIdleTimeoutSeconds = func() int { panic("PluginDefaultIdleTimeoutSeconds called after service construction") }
+	PluginDefaultMaxLifetimeSeconds = func() int { panic("PluginDefaultMaxLifetimeSeconds called after service construction") }
+
+	res, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType: driver.name,
+		RootPath:    "/work",
+		Mode:        pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.GetLease().GetExpiresAt().AsTime().Equal(openTestNow.Add(10*time.Minute)) ||
+		!res.GetLease().GetIdleExpiresAt().AsTime().Equal(openTestNow.Add(2*time.Minute)) ||
+		!res.GetLease().GetMaxExpiresAt().AsTime().Equal(openTestNow.Add(30*time.Minute)) {
+		t.Fatalf("unexpected lease: %+v", res.GetLease())
+	}
+}
+
 func TestOpenInitializesBackendAndCreatesSessionWithNormalizedRootAndExternalRef(t *testing.T) {
 	driver := registerOpenTestBackend(t, &openTestDriver{mutateParams: true})
 	svc := newOpenTestSidecarService([]string{"open-s1"}, testOpenPolicy("client-a"))
@@ -1092,6 +1150,77 @@ func TestReadFileStreamsDataWithOffsetLimit(t *testing.T) {
 	}
 }
 
+func TestReadFileLimitZeroExceedingConfiguredStreamLimitReturnsResourceExhausted(t *testing.T) {
+	backend := &filesystemRPCBackend{catData: "hello"}
+	svc := newTestSidecarService(t, nil, []openSessionInput{
+		testOpenInputWithBackend("client-a", "s1", backend),
+	})
+	svc.maxStreamBytes = 4
+	stream := newTestReadFileStream(identityContext("client-a"))
+
+	err := svc.ReadFile(&pb.ReadFileRequest{SessionId: "s1", Path: "data.bin", Limit: 0}, stream)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if got := stream.data(); got != "hell" {
+		t.Fatalf("streamed data=%q", got)
+	}
+	if !backend.catClosed {
+		t.Fatal("reader was not closed")
+	}
+}
+
+func TestReadFileUserLimitBelowConfiguredStreamLimitSucceeds(t *testing.T) {
+	backend := &filesystemRPCBackend{catData: "hello"}
+	svc := newTestSidecarService(t, nil, []openSessionInput{
+		testOpenInputWithBackend("client-a", "s1", backend),
+	})
+	svc.maxStreamBytes = 4
+	stream := newTestReadFileStream(identityContext("client-a"))
+
+	if err := svc.ReadFile(&pb.ReadFileRequest{SessionId: "s1", Path: "data.bin", Limit: 3}, stream); err != nil {
+		t.Fatal(err)
+	}
+	if got := stream.data(); got != "hel" {
+		t.Fatalf("streamed data=%q", got)
+	}
+}
+
+func TestReadFilePolicyStreamLimitOverridesGlobalLimit(t *testing.T) {
+	oldMaxStreamBytes := PluginMaxStreamBytes
+	PluginMaxStreamBytes = func() int64 { return 10 }
+	t.Cleanup(func() { PluginMaxStreamBytes = oldMaxStreamBytes })
+
+	backend := &filesystemRPCBackend{
+		statInfo: fakeInfo{name: "work", isDir: true, mode: os.ModeDir | 0o755},
+		catData:  "hello",
+	}
+	backendName := registerFilesystemOpenTestBackend(t, backend)
+	svc := newOpenTestSidecarService([]string{"open-s1"}, &policyEngine{clients: []clientPolicy{{
+		Identity:    "client-a",
+		AccessModes: []string{"read"},
+		Lease:       leaseJSON{DurationSeconds: 300, IdleTimeoutSeconds: 60, MaxLifetimeSeconds: 900},
+		Limits:      limitsJSON{MaxStreamBytes: 4},
+	}}})
+
+	res, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType: backendName,
+		RootPath:    "/work",
+		Mode:        pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := newTestReadFileStream(identityContext("client-a"))
+	err = svc.ReadFile(&pb.ReadFileRequest{SessionId: res.GetSessionId(), Path: "data.bin"}, stream)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if got := stream.data(); got != "hell" {
+		t.Fatalf("streamed data=%q", got)
+	}
+}
+
 func TestReadFileNilReaderReturnsGrpcError(t *testing.T) {
 	backend := &filesystemRPCBackend{catNil: true}
 	svc := newTestSidecarService(t, nil, []openSessionInput{
@@ -1127,6 +1256,86 @@ func TestWriteFileWritesChunksAndReportsBytesWritten(t *testing.T) {
 	}
 	if stream.closedResponse == nil || stream.closedResponse.GetBytesWritten() != int64(len("hello sidecar")) {
 		t.Fatalf("unexpected response: %+v", stream.closedResponse)
+	}
+}
+
+func TestWriteFileOverwriteFalseExistingTargetRejectsBeforeBodyAndSave(t *testing.T) {
+	backend := &filesystemRPCBackend{statInfo: fakeInfo{name: "out.txt", size: 99}}
+	svc := newTestSidecarService(t, nil, []openSessionInput{
+		testOpenInputWithBackend("client-a", "s1", backend),
+	})
+	stream := newTestWriteFileStream(identityContext("client-a"), []*pb.WriteFileRequest{
+		writeFileHeaderOverwrite("s1", "out.txt", 0, false),
+		writeFileData("hello"),
+	})
+
+	err := svc.WriteFile(stream)
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if backend.savePath != "" {
+		t.Fatalf("save was called with path=%q", backend.savePath)
+	}
+	if len(stream.requests) != 1 {
+		t.Fatalf("body messages consumed=%d want 0", 1-len(stream.requests))
+	}
+}
+
+func TestWriteFileOverwriteTrueAllowsSaveWhenTargetExists(t *testing.T) {
+	backend := &filesystemRPCBackend{statInfo: fakeInfo{name: "out.txt", size: 99}}
+	svc := newTestSidecarService(t, nil, []openSessionInput{
+		testOpenInputWithBackend("client-a", "s1", backend),
+	})
+	stream := newTestWriteFileStream(identityContext("client-a"), []*pb.WriteFileRequest{
+		writeFileHeaderOverwrite("s1", "out.txt", int64(len("hello")), true),
+		writeFileData("hello"),
+	})
+
+	if err := svc.WriteFile(stream); err != nil {
+		t.Fatal(err)
+	}
+	if backend.savePath != "/work/out.txt" {
+		t.Fatalf("save path=%q", backend.savePath)
+	}
+	if backend.savedData != "hello" {
+		t.Fatalf("saved data=%q", backend.savedData)
+	}
+}
+
+func TestWriteFilePolicyStreamLimitOverridesGlobalLimit(t *testing.T) {
+	oldMaxStreamBytes := PluginMaxStreamBytes
+	PluginMaxStreamBytes = func() int64 { return 10 }
+	t.Cleanup(func() { PluginMaxStreamBytes = oldMaxStreamBytes })
+
+	backend := &filesystemRPCBackend{
+		statInfo: fakeInfo{name: "work", isDir: true, mode: os.ModeDir | 0o755},
+	}
+	backendName := registerFilesystemOpenTestBackend(t, backend)
+	svc := newOpenTestSidecarService([]string{"open-s1"}, &policyEngine{clients: []clientPolicy{{
+		Identity:    "client-a",
+		AccessModes: []string{"read", "write"},
+		Lease:       leaseJSON{DurationSeconds: 300, IdleTimeoutSeconds: 60, MaxLifetimeSeconds: 900},
+		Limits:      limitsJSON{MaxStreamBytes: 4},
+	}}})
+
+	res, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType: backendName,
+		RootPath:    "/work",
+		Mode:        pb.AccessMode_ACCESS_MODE_READ_WRITE,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := newTestWriteFileStream(identityContext("client-a"), []*pb.WriteFileRequest{
+		writeFileHeaderOverwrite(res.GetSessionId(), "out.txt", 0, true),
+		writeFileData("hello"),
+	})
+	err = svc.WriteFile(stream)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if backend.savePath != "" {
+		t.Fatalf("save was called with path=%q", backend.savePath)
 	}
 }
 
@@ -1537,6 +1746,28 @@ func registerNamedOpenTestBackend(t *testing.T, name string, driver *openTestDri
 	return driver
 }
 
+func registerFilesystemOpenTestBackend(t *testing.T, backend *filesystemRPCBackend) string {
+	t.Helper()
+	name := uniqueOpenBackendName(t)
+	Backend.Register(name, &filesystemOpenTestDriver{backend: backend})
+	return name
+}
+
+type filesystemOpenTestDriver struct {
+	Nothing
+
+	backend *filesystemRPCBackend
+	initCtx context.Context
+}
+
+func (d *filesystemOpenTestDriver) Init(_ map[string]string, app *App) (IBackend, error) {
+	if app == nil || app.Context == nil {
+		return nil, ErrInternal
+	}
+	d.initCtx = app.Context
+	return d.backend, nil
+}
+
 type openTestDriver struct {
 	Nothing
 
@@ -1921,11 +2152,16 @@ func (s *testWriteFileStream) RecvMsg(any) error {
 }
 
 func writeFileHeader(sessionID, path string, expectedSize int64) *pb.WriteFileRequest {
+	return writeFileHeaderOverwrite(sessionID, path, expectedSize, false)
+}
+
+func writeFileHeaderOverwrite(sessionID, path string, expectedSize int64, overwrite bool) *pb.WriteFileRequest {
 	return &pb.WriteFileRequest{
 		Payload: &pb.WriteFileRequest_Header{
 			Header: &pb.WriteFileHeader{
 				SessionId:    sessionID,
 				Path:         path,
+				Overwrite:    overwrite,
 				ExpectedSize: expectedSize,
 			},
 		},

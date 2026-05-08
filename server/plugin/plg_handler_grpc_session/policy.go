@@ -55,6 +55,7 @@ type openPolicyRequest struct {
 	backendParams map[string]string
 	mode          pb.AccessMode
 	lease         leaseRequest
+	defaultLease  effectiveLease
 }
 
 type effectivePolicy struct {
@@ -112,7 +113,7 @@ func (p *clientPolicy) effectiveOpen(req openPolicyRequest) (effectivePolicy, er
 	return effectivePolicy{
 		operator:       p.Role == "operator",
 		mode:           mode,
-		lease:          p.clampLease(req.lease),
+		lease:          p.clampLease(req.lease, req.defaultLease),
 		maxSessions:    p.MaxSessions,
 		maxStreamBytes: p.Limits.MaxStreamBytes,
 	}, nil
@@ -147,16 +148,23 @@ func (p *clientPolicy) clampMode(requested pb.AccessMode) pb.AccessMode {
 	return pb.AccessMode_ACCESS_MODE_UNSPECIFIED
 }
 
-func (p *clientPolicy) clampLease(req leaseRequest) effectiveLease {
-	maxDuration := seconds(p.Lease.DurationSeconds)
-	maxIdle := seconds(p.Lease.IdleTimeoutSeconds)
-	maxLifetime := seconds(p.Lease.MaxLifetimeSeconds)
+func (p *clientPolicy) clampLease(req leaseRequest, defaults effectiveLease) effectiveLease {
+	maxDuration := policyOrDefaultDuration(p.Lease.DurationSeconds, defaults.duration)
+	maxIdle := policyOrDefaultDuration(p.Lease.IdleTimeoutSeconds, defaults.idleTimeout)
+	maxLifetime := policyOrDefaultDuration(p.Lease.MaxLifetimeSeconds, defaults.maxLifetime)
 	return effectiveLease{
 		duration:    clampDuration(req.duration, maxDuration),
 		idleTimeout: clampDuration(req.idleTimeout, maxIdle),
 		maxLifetime: clampDuration(req.maxLifetime, maxLifetime),
 		renewable:   req.renewable && p.Lease.Renewable,
 	}
+}
+
+func policyOrDefaultDuration(policySeconds uint32, fallback time.Duration) time.Duration {
+	if policySeconds > 0 {
+		return seconds(policySeconds)
+	}
+	return fallback
 }
 
 func seconds(v uint32) time.Duration {

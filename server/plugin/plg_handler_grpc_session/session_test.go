@@ -132,3 +132,98 @@ func TestSessionCloseIsIdempotentAndClosesBackend(t *testing.T) {
 		t.Fatalf("closed=%d", backend.closed)
 	}
 }
+
+func TestSidecarJanitorScanExpiresSessionsWithoutRPC(t *testing.T) {
+	now := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
+	ids := []string{"ttl", "idle", "max"}
+	nextID := 0
+	m := newSessionManager(sessionManagerOptions{
+		now: func() time.Time { return now },
+		id: func() (string, error) {
+			id := ids[nextID]
+			nextID++
+			return id, nil
+		},
+	})
+
+	type opened struct {
+		session *sidecarSession
+		backend *closeTrackingBackend
+		ctx     context.Context
+	}
+	openedSessions := make([]opened, 0, len(ids))
+	for _, tc := range []struct {
+		name  string
+		lease effectiveLease
+	}{
+		{
+			name: "ttl",
+			lease: effectiveLease{
+				duration:    time.Minute,
+				idleTimeout: time.Hour,
+				maxLifetime: time.Hour,
+			},
+		},
+		{
+			name: "idle",
+			lease: effectiveLease{
+				duration:    time.Hour,
+				idleTimeout: time.Minute,
+				maxLifetime: time.Hour,
+			},
+		},
+		{
+			name: "max",
+			lease: effectiveLease{
+				duration:    time.Hour,
+				idleTimeout: time.Hour,
+				maxLifetime: time.Minute,
+			},
+		},
+	} {
+		backend := &closeTrackingBackend{}
+		ctx, cancel := context.WithCancel(context.Background())
+		session, err := m.open(context.Background(), openSessionInput{
+			ownerIdentity: "client-a",
+			backendType:   "local",
+			backend:       backend,
+			rootPath:      "/work",
+			mode:          pb.AccessMode_ACCESS_MODE_READ,
+			lease:         tc.lease,
+			ctx:           ctx,
+			cancel:        cancel,
+		})
+		if err != nil {
+			t.Fatalf("%s open: %v", tc.name, err)
+		}
+		openedSessions = append(openedSessions, opened{session: session, backend: backend, ctx: ctx})
+	}
+
+	now = now.Add(time.Minute)
+	if expired := m.scanExpiredSessions(); expired != len(openedSessions) {
+		t.Fatalf("expired=%d want=%d", expired, len(openedSessions))
+	}
+	for _, opened := range openedSessions {
+		if opened.backend.closed != 1 {
+			t.Fatalf("%s closed=%d", opened.session.id, opened.backend.closed)
+		}
+		if opened.ctx.Err() == nil {
+			t.Fatalf("%s context was not canceled", opened.session.id)
+		}
+		opened.session.mu.Lock()
+		state := opened.session.state
+		opened.session.mu.Unlock()
+		if state != pb.SessionState_SESSION_STATE_EXPIRED {
+			t.Fatalf("%s state=%s", opened.session.id, state)
+		}
+	}
+
+	if expired := m.scanExpiredSessions(); expired != 0 {
+		t.Fatalf("second scan expired=%d", expired)
+	}
+	for _, opened := range openedSessions {
+		if opened.backend.closed != 1 {
+			t.Fatalf("%s closed after second scan=%d", opened.session.id, opened.backend.closed)
+		}
+	}
+}

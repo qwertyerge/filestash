@@ -47,6 +47,7 @@ type sidecarSession struct {
 	idleExpiresAt  time.Time
 	maxExpiresAt   time.Time
 	lease          effectiveLease
+	maxStreamBytes int64
 	state          pb.SessionState
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -66,6 +67,7 @@ type openSessionInput struct {
 	mode           pb.AccessMode
 	externalRef    externalRef
 	lease          effectiveLease
+	maxStreamBytes int64
 	ctx            context.Context
 	cancel         context.CancelFunc
 	commitCtx      context.Context
@@ -153,6 +155,7 @@ func (m *sessionManager) open(parent context.Context, in openSessionInput) (*sid
 		idleExpiresAt:  lease.idleExpiresAt,
 		maxExpiresAt:   lease.maxExpiresAt,
 		lease:          in.lease,
+		maxStreamBytes: in.maxStreamBytes,
 		state:          pb.SessionState_SESSION_STATE_ACTIVE,
 		ctx:            ctx,
 		cancel:         cancel,
@@ -400,6 +403,21 @@ func (m *sessionManager) lookup(caller string, operator bool, id string) (*sidec
 		return nil, ErrNotAllowed
 	}
 	return s, nil
+}
+
+func (m *sessionManager) scanExpiredSessions() int {
+	now := m.now()
+	m.mu.Lock()
+	expired := make([]*sidecarSession, 0)
+	for _, session := range m.sessions {
+		if _, didExpire := session.stateAt(now); didExpire {
+			expired = append(expired, session)
+		}
+	}
+	m.mu.Unlock()
+
+	finalizeExpiredSessions(expired)
+	return len(expired)
 }
 
 func ensureActive(s *sidecarSession) error {

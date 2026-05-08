@@ -170,6 +170,22 @@ func TestSidecarServerStopClosesActiveSessions(t *testing.T) {
 	}
 }
 
+func TestSidecarJanitorStopsOnRuntimeStop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime := &sidecarRuntime{
+		sessions: newSessionManager(sessionManagerOptions{}),
+		cancel:   cancel,
+	}
+	runtime.startSessionJanitor(ctx)
+
+	runtime.stop()
+	select {
+	case <-runtime.janitorDone:
+	case <-time.After(time.Second):
+		t.Fatal("janitor did not stop")
+	}
+}
+
 func TestSidecarRuntimeStopClosesBackendWithoutWaitingForStuckOperation(t *testing.T) {
 	files := writeMTLSTestFiles(t)
 	overrideSidecarConfig(t, files, `{"clients":[{"identity":"client-a","access_modes":["read"]}]}`)

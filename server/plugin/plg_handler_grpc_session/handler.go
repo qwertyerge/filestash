@@ -2,6 +2,7 @@ package plg_handler_grpc_session
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/url"
 	"os"
@@ -25,6 +26,7 @@ type sidecarService struct {
 	policies       *policyEngine
 	maxSessions    int
 	maxStreamBytes int64
+	defaultLease   effectiveLease
 }
 
 type sessionCaller struct {
@@ -58,6 +60,7 @@ func newSidecarService(sessions *sessionManager, policies *policyEngine) (*sidec
 		policies:       policies,
 		maxSessions:    PluginMaxSessions(),
 		maxStreamBytes: PluginMaxStreamBytes(),
+		defaultLease:   defaultLeaseFromConfig(),
 	}, nil
 }
 
@@ -145,6 +148,7 @@ func (s *sidecarService) Open(ctx context.Context, req *pb.OpenRequest) (*pb.Ope
 		backendParams: params,
 		mode:          req.GetMode(),
 		lease:         leaseRequestFromProto(req.GetLease()),
+		defaultLease:  s.defaultLease,
 	})
 	if err != nil {
 		cleanup()
@@ -178,6 +182,7 @@ func (s *sidecarService) Open(ctx context.Context, req *pb.OpenRequest) (*pb.Ope
 		mode:           effective.mode,
 		externalRef:    externalRefFromProto(req.GetExternalRef()),
 		lease:          effective.lease,
+		maxStreamBytes: effectiveMaxStreamBytes(s.maxStreamBytes, effective.maxStreamBytes),
 		ctx:            sessionCtx,
 		cancel:         sessionCancel,
 		commitCtx:      ctx,
@@ -387,7 +392,7 @@ func (s *sidecarService) ReadFile(req *pb.ReadFileRequest, stream pb.FilestashSi
 	}
 
 	buf := make([]byte, 32*1024)
-	remaining := req.GetLimit()
+	remaining, limitedByMax := readFileLimit(req.GetLimit(), s.readFileMaxBytes(session))
 	for {
 		readBuf := buf
 		if remaining > 0 && int64(len(readBuf)) > remaining {
@@ -401,6 +406,21 @@ func (s *sidecarService) ReadFile(req *pb.ReadFileRequest, stream pb.FilestashSi
 			if remaining > 0 {
 				remaining -= int64(n)
 				if remaining == 0 {
+					if limitedByMax {
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							return grpcError(err)
+						}
+						hasMore, moreErr := readerHasMore(reader)
+						if moreErr != nil {
+							return grpcError(moreErr)
+						}
+						if hasMore {
+							return status.Errorf(codes.ResourceExhausted, "read stream exceeds max size %d", s.readFileMaxBytes(session))
+						}
+					}
 					break
 				}
 			}
@@ -444,8 +464,18 @@ func (s *sidecarService) WriteFile(stream pb.FilestashSidecarService_WriteFileSe
 	if err != nil {
 		return grpcError(err)
 	}
+	if !header.GetOverwrite() {
+		info, err := session.backend.Stat(resolved)
+		if err != nil {
+			if !errors.Is(err, ErrNotFound) {
+				return grpcError(err)
+			}
+		} else if info != nil {
+			return grpcError(ErrConflict)
+		}
+	}
 
-	return s.writeFileStaged(stream, session, resolved, header.GetExpectedSize(), s.writeFileMaxBytes())
+	return s.writeFileStaged(stream, session, resolved, header.GetExpectedSize(), s.writeFileMaxBytes(session))
 }
 
 func (s *sidecarService) writeFileStaged(stream pb.FilestashSidecarService_WriteFileServer, session *sidecarSession, resolved string, expected int64, maxBytes int64) error {
@@ -498,11 +528,78 @@ func (s *sidecarService) writeFileStaged(stream pb.FilestashSidecarService_Write
 	return nil
 }
 
-func (s *sidecarService) writeFileMaxBytes() int64 {
+func (s *sidecarService) readFileMaxBytes(session *sidecarSession) int64 {
+	return s.sessionMaxStreamBytes(session)
+}
+
+func (s *sidecarService) writeFileMaxBytes(session *sidecarSession) int64 {
+	if maxBytes := s.sessionMaxStreamBytes(session); maxBytes > 0 {
+		return maxBytes
+	}
+	return 1 << 30
+}
+
+func (s *sidecarService) sessionMaxStreamBytes(session *sidecarSession) int64 {
+	if session != nil && session.maxStreamBytes > 0 {
+		return session.maxStreamBytes
+	}
 	if s.maxStreamBytes > 0 {
 		return s.maxStreamBytes
 	}
-	return 1 << 30
+	return 0
+}
+
+func readFileLimit(userLimit, maxBytes int64) (int64, bool) {
+	if maxBytes <= 0 {
+		return userLimit, false
+	}
+	if userLimit <= 0 || maxBytes <= userLimit {
+		return maxBytes, true
+	}
+	return userLimit, false
+}
+
+func readerHasMore(reader io.Reader) (bool, error) {
+	var one [1]byte
+	n, err := reader.Read(one[:])
+	if n > 0 {
+		return true, nil
+	}
+	if err == io.EOF {
+		return false, nil
+	}
+	return false, err
+}
+
+func effectiveMaxStreamBytes(global, policy int64) int64 {
+	switch {
+	case global > 0 && policy > 0:
+		if global < policy {
+			return global
+		}
+		return policy
+	case policy > 0:
+		return policy
+	case global > 0:
+		return global
+	default:
+		return 0
+	}
+}
+
+func defaultLeaseFromConfig() effectiveLease {
+	return effectiveLease{
+		duration:    configSeconds(PluginDefaultLeaseSeconds()),
+		idleTimeout: configSeconds(PluginDefaultIdleTimeoutSeconds()),
+		maxLifetime: configSeconds(PluginDefaultMaxLifetimeSeconds()),
+	}
+}
+
+func configSeconds(v int) time.Duration {
+	if v <= 0 {
+		return 0
+	}
+	return time.Duration(v) * time.Second
 }
 
 func parseWriteFileDataMessage(req *pb.WriteFileRequest) ([]byte, error) {
