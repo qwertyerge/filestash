@@ -36,11 +36,11 @@ func (r pathResolver) resolve(input string, usage pathUse) (string, error) {
 		if usage == pathUseRead {
 			return r.root, nil
 		}
-		return "", ErrNotAllowed
+		return "", ErrNotValid
 	}
 
 	if path.IsAbs(input) {
-		return "", ErrNotAllowed
+		return "", ErrNotValid
 	}
 
 	input = path.Clean(input)
@@ -48,15 +48,15 @@ func (r pathResolver) resolve(input string, usage pathUse) (string, error) {
 		if usage == pathUseRead {
 			return r.root, nil
 		}
-		return "", ErrNotAllowed
+		return "", ErrNotValid
 	}
 	if input == ".." || strings.HasPrefix(input, "../") {
-		return "", ErrNotAllowed
+		return "", ErrNotValid
 	}
 
 	resolved := path.Join(r.root, input)
 	if r.root != "/" && !strings.HasPrefix(resolved, r.root+"/") {
-		return "", ErrNotAllowed
+		return "", ErrNotValid
 	}
 
 	return resolved, nil

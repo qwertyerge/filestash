@@ -9,6 +9,8 @@ import (
 
 	. "github.com/mickael-kerjean/filestash/server/common"
 	"github.com/mickael-kerjean/filestash/server/plugin/plg_handler_grpc_session/pb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type effectiveLease struct {
@@ -31,33 +33,41 @@ type externalRef struct {
 }
 
 type sidecarSession struct {
-	id            string
-	ownerIdentity string
-	backendType   string
-	backend       IBackend
-	rootPath      string
-	mode          pb.AccessMode
-	externalRef   externalRef
-	openedAt      time.Time
-	lastUsedAt    time.Time
-	expiresAt     time.Time
-	idleExpiresAt time.Time
-	maxExpiresAt  time.Time
-	lease         effectiveLease
-	state         pb.SessionState
-	ctx           context.Context
-	cancel        context.CancelFunc
-	mu            sync.Mutex
+	id             string
+	ownerIdentity  string
+	backendType    string
+	backend        IBackend
+	rootPath       string
+	redactedTarget string
+	mode           pb.AccessMode
+	externalRef    externalRef
+	openedAt       time.Time
+	lastUsedAt     time.Time
+	expiresAt      time.Time
+	idleExpiresAt  time.Time
+	maxExpiresAt   time.Time
+	lease          effectiveLease
+	state          pb.SessionState
+	ctx            context.Context
+	cancel         context.CancelFunc
+	ops            sync.WaitGroup
+	closeOnce      sync.Once
+	mu             sync.Mutex
 }
 
 type openSessionInput struct {
-	ownerIdentity string
-	backendType   string
-	backend       IBackend
-	rootPath      string
-	mode          pb.AccessMode
-	externalRef   externalRef
-	lease         effectiveLease
+	ownerIdentity  string
+	backendType    string
+	backend        IBackend
+	rootPath       string
+	redactedTarget string
+	mode           pb.AccessMode
+	externalRef    externalRef
+	lease          effectiveLease
+	ctx            context.Context
+	cancel         context.CancelFunc
+	commitCtx      context.Context
+	reservation    *openReservation
 }
 
 type sessionManagerOptions struct {
@@ -66,10 +76,18 @@ type sessionManagerOptions struct {
 }
 
 type sessionManager struct {
-	mu       sync.Mutex
-	sessions map[string]*sidecarSession
-	now      func() time.Time
-	id       func() (string, error)
+	mu           sync.Mutex
+	sessions     map[string]*sidecarSession
+	pendingOwner map[string]int
+	pendingTotal int
+	now          func() time.Time
+	id           func() (string, error)
+}
+
+type openReservation struct {
+	manager       *sessionManager
+	ownerIdentity string
+	released      bool
 }
 
 func newSessionManager(opts sessionManagerOptions) *sessionManager {
@@ -83,9 +101,10 @@ func newSessionManager(opts sessionManagerOptions) *sessionManager {
 	}
 
 	return &sessionManager{
-		sessions: make(map[string]*sidecarSession),
-		now:      now,
-		id:       id,
+		sessions:     make(map[string]*sidecarSession),
+		pendingOwner: make(map[string]int),
+		now:          now,
+		id:           id,
 	}
 }
 
@@ -98,9 +117,6 @@ func randomSessionID() (string, error) {
 }
 
 func (m *sessionManager) open(parent context.Context, in openSessionInput) (*sidecarSession, error) {
-	if parent == nil {
-		parent = context.Background()
-	}
 	id, err := m.id()
 	if err != nil {
 		return nil, err
@@ -110,46 +126,102 @@ func (m *sessionManager) open(parent context.Context, in openSessionInput) (*sid
 	}
 
 	now := m.now()
-	ctx, cancel := context.WithCancel(parent)
+	ctx := in.ctx
+	cancel := in.cancel
+	if ctx == nil || cancel == nil {
+		if parent == nil {
+			parent = context.Background()
+		}
+		ctx, cancel = context.WithCancel(parent)
+	}
 	lease := newSessionLeaseState(now, in.lease)
 	s := &sidecarSession{
-		id:            id,
-		ownerIdentity: in.ownerIdentity,
-		backendType:   in.backendType,
-		backend:       in.backend,
-		rootPath:      in.rootPath,
-		mode:          in.mode,
-		externalRef:   in.externalRef,
-		openedAt:      now,
-		lastUsedAt:    now,
-		expiresAt:     lease.expiresAt,
-		idleExpiresAt: lease.idleExpiresAt,
-		maxExpiresAt:  lease.maxExpiresAt,
-		lease:         in.lease,
-		state:         pb.SessionState_SESSION_STATE_ACTIVE,
-		ctx:           ctx,
-		cancel:        cancel,
+		id:             id,
+		ownerIdentity:  in.ownerIdentity,
+		backendType:    in.backendType,
+		backend:        in.backend,
+		rootPath:       in.rootPath,
+		redactedTarget: in.redactedTarget,
+		mode:           in.mode,
+		externalRef:    in.externalRef,
+		openedAt:       now,
+		lastUsedAt:     now,
+		expiresAt:      lease.expiresAt,
+		idleExpiresAt:  lease.idleExpiresAt,
+		maxExpiresAt:   lease.maxExpiresAt,
+		lease:          in.lease,
+		state:          pb.SessionState_SESSION_STATE_ACTIVE,
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	beforeOpenSessionInsert(in.commitCtx)
+	if in.commitCtx != nil && in.commitCtx.Err() != nil {
+		if in.reservation != nil {
+			in.reservation.releaseLocked()
+		}
+		cancel()
+		return nil, status.FromContextError(in.commitCtx.Err()).Err()
+	}
 	if _, ok := m.sessions[id]; ok {
+		if in.reservation != nil {
+			in.reservation.releaseLocked()
+		}
 		cancel()
 		return nil, ErrConflict
 	}
 	m.sessions[id] = s
+	if in.reservation != nil {
+		in.reservation.releaseLocked()
+	}
 	return s, nil
 }
 
 func (m *sessionManager) get(caller string, operator bool, id string) (*sidecarSession, error) {
-	s, err := m.lookup(caller, operator, id)
+	s, release, err := m.acquire(caller, operator, id)
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureActiveAt(s, m.now()); err != nil {
-		return nil, err
-	}
+	release()
 	return s, nil
+}
+
+func (m *sessionManager) acquire(caller string, operator bool, id string) (*sidecarSession, func(), error) {
+	s, err := m.lookup(caller, operator, id)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	now := m.now()
+	s.mu.Lock()
+	if s.state == pb.SessionState_SESSION_STATE_CLOSED {
+		s.mu.Unlock()
+		return nil, nil, ErrSessionInactive
+	}
+	if deadlineReached(now, s.expiresAt) ||
+		deadlineReached(now, s.idleExpiresAt) ||
+		deadlineReached(now, s.maxExpiresAt) {
+		s.state = pb.SessionState_SESSION_STATE_EXPIRED
+		s.mu.Unlock()
+		s.finalize()
+		return nil, nil, ErrTimeout
+	}
+	if s.state != pb.SessionState_SESSION_STATE_ACTIVE {
+		s.mu.Unlock()
+		return nil, nil, ErrSessionInactive
+	}
+	s.ops.Add(1)
+	s.mu.Unlock()
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			s.ops.Done()
+		})
+	}
+	return s, release, nil
 }
 
 func (m *sessionManager) renew(caller string, operator bool, id string) (sessionLeaseState, error) {
@@ -160,21 +232,25 @@ func (m *sessionManager) renew(caller string, operator bool, id string) (session
 
 	now := m.now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.state == pb.SessionState_SESSION_STATE_CLOSED {
-		return sessionLeaseState{}, ErrNotAllowed
+		s.mu.Unlock()
+		return sessionLeaseState{}, ErrSessionInactive
 	}
 	if deadlineReached(now, s.expiresAt) ||
 		deadlineReached(now, s.idleExpiresAt) ||
 		deadlineReached(now, s.maxExpiresAt) {
 		s.state = pb.SessionState_SESSION_STATE_EXPIRED
+		s.mu.Unlock()
+		s.finalize()
 		return sessionLeaseState{}, ErrTimeout
 	}
 	if s.state != pb.SessionState_SESSION_STATE_ACTIVE {
-		return sessionLeaseState{}, ErrNotAllowed
+		s.mu.Unlock()
+		return sessionLeaseState{}, ErrSessionInactive
 	}
 	if !s.lease.renewable {
-		return sessionLeaseState{}, ErrNotAllowed
+		s.mu.Unlock()
+		return sessionLeaseState{}, ErrSessionInactive
 	}
 
 	expiresAt := addDuration(now, s.lease.duration)
@@ -182,12 +258,14 @@ func (m *sessionManager) renew(caller string, operator bool, id string) (session
 	s.lastUsedAt = now
 	s.expiresAt = expiresAt
 	s.idleExpiresAt = addDuration(now, s.lease.idleTimeout)
-	return sessionLeaseState{
+	lease := sessionLeaseState{
 		expiresAt:     s.expiresAt,
 		idleExpiresAt: s.idleExpiresAt,
 		maxExpiresAt:  s.maxExpiresAt,
 		renewable:     s.lease.renewable,
-	}, nil
+	}
+	s.mu.Unlock()
+	return lease, nil
 }
 
 func (m *sessionManager) markUsed(s *sidecarSession) {
@@ -196,6 +274,92 @@ func (m *sessionManager) markUsed(s *sidecarSession) {
 	now := m.now()
 	s.lastUsedAt = now
 	s.idleExpiresAt = addDuration(now, s.lease.idleTimeout)
+}
+
+func (m *sessionManager) activeCount(ownerIdentity string, now time.Time) int {
+	m.mu.Lock()
+	sessions := make([]*sidecarSession, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		sessions = append(sessions, session)
+	}
+	m.mu.Unlock()
+
+	count := 0
+	for _, session := range sessions {
+		snapshot := snapshotSession(session, now)
+		if snapshot.state != pb.SessionState_SESSION_STATE_ACTIVE {
+			continue
+		}
+		if ownerIdentity != "" && snapshot.ownerIdentity != ownerIdentity {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func (m *sessionManager) reserveOpen(ownerIdentity string, globalMax, ownerMax int) (*openReservation, error) {
+	now := m.now()
+	m.mu.Lock()
+	activeGlobal := 0
+	activeOwner := 0
+	expired := []*sidecarSession{}
+	for _, session := range m.sessions {
+		state, didExpire := session.stateAt(now)
+		if didExpire {
+			expired = append(expired, session)
+		}
+		if state != pb.SessionState_SESSION_STATE_ACTIVE {
+			continue
+		}
+		activeGlobal++
+		if session.ownerIdentity == ownerIdentity {
+			activeOwner++
+		}
+	}
+	pendingGlobal := m.pendingTotal
+	pendingOwner := m.pendingOwner[ownerIdentity]
+	if globalMax > 0 && activeGlobal+pendingGlobal >= globalMax {
+		m.mu.Unlock()
+		finalizeExpiredSessions(expired)
+		return nil, status.Error(codes.ResourceExhausted, "maximum active sessions reached")
+	}
+	if ownerMax > 0 && activeOwner+pendingOwner >= ownerMax {
+		m.mu.Unlock()
+		finalizeExpiredSessions(expired)
+		return nil, status.Error(codes.ResourceExhausted, "maximum active sessions reached for identity")
+	}
+	m.pendingTotal++
+	m.pendingOwner[ownerIdentity]++
+	reservation := &openReservation{
+		manager:       m,
+		ownerIdentity: ownerIdentity,
+	}
+	m.mu.Unlock()
+	finalizeExpiredSessions(expired)
+	return reservation, nil
+}
+
+func (r *openReservation) release() {
+	if r == nil || r.manager == nil {
+		return
+	}
+	r.manager.mu.Lock()
+	defer r.manager.mu.Unlock()
+	r.releaseLocked()
+}
+
+func (r *openReservation) releaseLocked() {
+	if r == nil || r.released {
+		return
+	}
+	r.released = true
+	m := r.manager
+	m.pendingTotal--
+	m.pendingOwner[r.ownerIdentity]--
+	if m.pendingOwner[r.ownerIdentity] <= 0 {
+		delete(m.pendingOwner, r.ownerIdentity)
+	}
 }
 
 func (m *sessionManager) close(caller string, operator bool, id string) error {
@@ -210,21 +374,10 @@ func (m *sessionManager) close(caller string, operator bool, id string) error {
 		return nil
 	}
 	s.state = pb.SessionState_SESSION_STATE_CLOSED
-	cancel := s.cancel
-	backend := s.backend
 	s.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
-	}
-	if closer, ok := backend.(interface{ Close() error }); ok {
-		return closer.Close()
-	}
+	s.finalize()
 	return nil
-}
-
-func ensureActive(s *sidecarSession) error {
-	return ensureActiveAt(s, time.Now())
 }
 
 func (m *sessionManager) lookup(caller string, operator bool, id string) (*sidecarSession, error) {
@@ -240,22 +393,59 @@ func (m *sessionManager) lookup(caller string, operator bool, id string) (*sidec
 	return s, nil
 }
 
+func ensureActive(s *sidecarSession) error {
+	return ensureActiveAt(s, time.Now())
+}
+
 func ensureActiveAt(s *sidecarSession, now time.Time) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.state == pb.SessionState_SESSION_STATE_CLOSED {
-		return ErrNotAllowed
+		s.mu.Unlock()
+		return ErrSessionInactive
 	}
 	if deadlineReached(now, s.expiresAt) ||
 		deadlineReached(now, s.idleExpiresAt) ||
 		deadlineReached(now, s.maxExpiresAt) {
 		s.state = pb.SessionState_SESSION_STATE_EXPIRED
+		s.mu.Unlock()
+		s.finalize()
 		return ErrTimeout
 	}
 	if s.state != pb.SessionState_SESSION_STATE_ACTIVE {
-		return ErrNotAllowed
+		s.mu.Unlock()
+		return ErrSessionInactive
 	}
+	s.mu.Unlock()
 	return nil
+}
+
+func (s *sidecarSession) stateAt(now time.Time) (pb.SessionState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state == pb.SessionState_SESSION_STATE_ACTIVE &&
+		(deadlineReached(now, s.expiresAt) ||
+			deadlineReached(now, s.idleExpiresAt) ||
+			deadlineReached(now, s.maxExpiresAt)) {
+		s.state = pb.SessionState_SESSION_STATE_EXPIRED
+		return s.state, true
+	}
+	return s.state, false
+}
+
+func (s *sidecarSession) finalize() {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.closeOnce.Do(func() {
+		s.ops.Wait()
+		closeBackend(s.backend)
+	})
+}
+
+func finalizeExpiredSessions(sessions []*sidecarSession) {
+	for _, session := range sessions {
+		session.finalize()
+	}
 }
 
 func newSessionLeaseState(now time.Time, lease effectiveLease) sessionLeaseState {

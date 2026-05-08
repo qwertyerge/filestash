@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,17 @@ func TestRenewSessionRPCRequiresOwner(t *testing.T) {
 	}
 }
 
+func TestRenewSessionNonRenewableIsFailedPrecondition(t *testing.T) {
+	input := testOpenInput("client-a", "s1")
+	input.lease.renewable = false
+	svc := newTestSidecarService(t, nil, []openSessionInput{input})
+
+	_, err := svc.RenewSession(identityContext("client-a"), &pb.RenewSessionRequest{SessionId: "s1"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+}
+
 func TestCloseSessionRPCIsIdempotent(t *testing.T) {
 	backend := &closeTrackingBackend{}
 	svc := newTestSidecarService(t, nil, []openSessionInput{testOpenInputWithBackend("client-a", "s1", backend)})
@@ -50,6 +62,24 @@ func TestCloseSessionRPCIsIdempotent(t *testing.T) {
 		res, err := svc.Close(identityContext("client-a"), &pb.CloseSessionRequest{SessionId: "s1"})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if res.GetSessionId() != "s1" || res.GetState() != pb.SessionState_SESSION_STATE_CLOSED {
+			t.Fatalf("unexpected close response: %+v", res)
+		}
+	}
+	if backend.closed != 1 {
+		t.Fatalf("closed=%d", backend.closed)
+	}
+}
+
+func TestCloseSessionRPCSucceedsWhenBackendCloseReturnsError(t *testing.T) {
+	backend := &closeErrorBackend{}
+	svc := newTestSidecarService(t, nil, []openSessionInput{testOpenInputWithBackend("client-a", "s1", backend)})
+
+	for i := 0; i < 2; i++ {
+		res, err := svc.Close(identityContext("client-a"), &pb.CloseSessionRequest{SessionId: "s1"})
+		if err != nil {
+			t.Fatalf("close %d: %v", i+1, err)
 		}
 		if res.GetSessionId() != "s1" || res.GetState() != pb.SessionState_SESSION_STATE_CLOSED {
 			t.Fatalf("unexpected close response: %+v", res)
@@ -222,6 +252,37 @@ func TestListSessionsFiltersOwnershipAndClosedSessions(t *testing.T) {
 	assertSessionIDs(t, operatorList.GetSessions(), []string{"s1", "s2"})
 }
 
+func TestListSessionsClosesExpiredSessionBackendOnce(t *testing.T) {
+	backend := &closeTrackingBackend{}
+	input := testOpenInputWithBackend("client-a", "s1", backend)
+	input.lease.duration = time.Minute
+	input.lease.idleTimeout = time.Minute
+	input.lease.maxLifetime = time.Minute
+	svc := newTestSidecarService(t, nil, []openSessionInput{input})
+	svc.sessionManager.now = func() time.Time { return time.Date(2026, 5, 8, 10, 2, 0, 0, time.UTC) }
+
+	activeOnly, err := svc.ListSessions(identityContext("client-a"), &pb.ListSessionsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activeOnly.GetSessions()) != 0 {
+		t.Fatalf("default list should hide expired sessions: %+v", activeOnly.GetSessions())
+	}
+
+	for i := 0; i < 2; i++ {
+		res, err := svc.ListSessions(identityContext("client-a"), &pb.ListSessionsRequest{IncludeClosed: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.GetSessions()) != 1 || res.GetSessions()[0].GetState() != pb.SessionState_SESSION_STATE_EXPIRED {
+			t.Fatalf("unexpected sessions: %+v", res.GetSessions())
+		}
+	}
+	if backend.closed != 1 {
+		t.Fatalf("closed=%d", backend.closed)
+	}
+}
+
 func TestGrpcErrorMapsConflictToAlreadyExists(t *testing.T) {
 	err := grpcError(ErrConflict)
 	if status.Code(err) != codes.AlreadyExists {
@@ -250,6 +311,483 @@ func TestSidecarServiceConstructorRequiresProductionDependencies(t *testing.T) {
 	}
 	if _, err := newSidecarService(sessions, nil); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("nil policies code=%s err=%v", status.Code(err), err)
+	}
+}
+
+func TestOpenUnknownBackendRejectsNotFound(t *testing.T) {
+	svc := newOpenTestSidecarService([]string{"open-s1"}, testOpenPolicy("client-a"))
+
+	_, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType:   uniqueOpenBackendName(t),
+		BackendParams: map[string]string{"hostname": "10.0.0.10"},
+		RootPath:      "/work",
+		Mode:          pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+}
+
+func TestOpenMissingRootOrBackendRejectsInvalidArgument(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1", "open-s2"}, testOpenPolicy("client-a"))
+
+	tests := []struct {
+		name string
+		req  *pb.OpenRequest
+	}{
+		{
+			name: "missing backend",
+			req:  &pb.OpenRequest{RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ},
+		},
+		{
+			name: "missing root",
+			req:  &pb.OpenRequest{BackendType: driver.name, Mode: pb.AccessMode_ACCESS_MODE_READ},
+		},
+		{
+			name: "invalid root",
+			req:  &pb.OpenRequest{BackendType: driver.name, RootPath: "../escape", Mode: pb.AccessMode_ACCESS_MODE_READ},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := svc.Open(identityContext("client-a"), tt.req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("code=%s err=%v", status.Code(err), err)
+			}
+			if driver.initCalls != 0 {
+				t.Fatalf("backend init was called %d times", driver.initCalls)
+			}
+		})
+	}
+}
+
+func TestOpenUnmappedIdentityRejectsUnauthenticated(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1"}, testOpenPolicy("client-a"))
+
+	_, err := svc.Open(identityContext("client-b"), &pb.OpenRequest{
+		BackendType: driver.name,
+		RootPath:    "/work",
+		Mode:        pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if driver.initCalls != 0 {
+		t.Fatalf("backend init was called %d times", driver.initCalls)
+	}
+}
+
+func TestOpenRequiresPolicyEngine(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1"}, nil)
+
+	_, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType: driver.name,
+		RootPath:    "/work",
+		Mode:        pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if driver.initCalls != 0 {
+		t.Fatalf("backend init was called %d times", driver.initCalls)
+	}
+}
+
+func TestOpenPolicyClampsReadWriteRequestToReadAndLease(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1"}, &policyEngine{clients: []clientPolicy{{
+		Identity:    "client-a",
+		AccessModes: []string{"read"},
+		Lease: leaseJSON{
+			DurationSeconds:    300,
+			IdleTimeoutSeconds: 60,
+			MaxLifetimeSeconds: 900,
+			Renewable:          false,
+		},
+	}}})
+
+	res, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType:   driver.name,
+		BackendParams: map[string]string{"hostname": "10.0.0.10"},
+		RootPath:      "/work/",
+		Mode:          pb.AccessMode_ACCESS_MODE_READ_WRITE,
+		Lease: &pb.LeaseOptions{
+			DurationSeconds:    3600,
+			IdleTimeoutSeconds: 120,
+			MaxLifetimeSeconds: 3600,
+			Renewable:          true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.GetEffectiveMode() != pb.AccessMode_ACCESS_MODE_READ {
+		t.Fatalf("mode=%s", res.GetEffectiveMode())
+	}
+	if res.GetLease().GetSessionId() != "open-s1" ||
+		!res.GetLease().GetExpiresAt().AsTime().Equal(openTestNow.Add(5*time.Minute)) ||
+		!res.GetLease().GetIdleExpiresAt().AsTime().Equal(openTestNow.Add(time.Minute)) ||
+		!res.GetLease().GetMaxExpiresAt().AsTime().Equal(openTestNow.Add(15*time.Minute)) ||
+		res.GetLease().GetRenewable() {
+		t.Fatalf("unexpected lease: %+v", res.GetLease())
+	}
+}
+
+func TestOpenInitializesBackendAndCreatesSessionWithNormalizedRootAndExternalRef(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{mutateParams: true})
+	svc := newOpenTestSidecarService([]string{"open-s1"}, testOpenPolicy("client-a"))
+	params := map[string]string{
+		"hostname": "10.0.0.10",
+		"username": "alice",
+	}
+
+	res, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType:   driver.name,
+		BackendParams: params,
+		RootPath:      "/work/",
+		Mode:          pb.AccessMode_ACCESS_MODE_READ,
+		ExternalRef:   &pb.ExternalRef{Kind: "job", Id: "job-123"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.GetSessionId() != "open-s1" {
+		t.Fatalf("session_id=%q", res.GetSessionId())
+	}
+	if params["mutated"] != "" {
+		t.Fatalf("request params were mutated: %+v", params)
+	}
+	if driver.initParams["hostname"] != "10.0.0.10" || driver.initParams["username"] != "alice" {
+		t.Fatalf("init params=%+v", driver.initParams)
+	}
+	session := svc.sessionManager.sessions["open-s1"]
+	if session == nil {
+		t.Fatal("session was not created")
+	}
+	if session.rootPath != "/work" ||
+		session.backendType != driver.name ||
+		session.mode != pb.AccessMode_ACCESS_MODE_READ ||
+		session.externalRef != (externalRef{kind: "job", id: "job-123"}) {
+		t.Fatalf("unexpected session: %+v", session)
+	}
+	if driver.handle.statPath != "/work" {
+		t.Fatalf("stat path=%q", driver.handle.statPath)
+	}
+}
+
+func TestOpenBackendContextOutlivesOpenRPCAndCancelsOnClose(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1"}, testOpenPolicy("client-a"))
+	openCtx, cancelOpen := context.WithCancel(identityContext("client-a"))
+
+	res, err := svc.Open(openCtx, &pb.OpenRequest{
+		BackendType: driver.name,
+		RootPath:    "/work",
+		Mode:        pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if driver.initCtx == nil {
+		t.Fatal("backend init did not receive context")
+	}
+
+	cancelOpen()
+	select {
+	case <-driver.initCtx.Done():
+		t.Fatal("backend context was canceled when Open RPC context was canceled")
+	default:
+	}
+
+	if _, err := svc.Close(identityContext("client-a"), &pb.CloseSessionRequest{SessionId: res.GetSessionId()}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-driver.initCtx.Done():
+	default:
+		t.Fatal("backend context was not canceled after session close")
+	}
+}
+
+func TestOpenRootVerificationFailureClosesBackendAndCreatesNoSession(t *testing.T) {
+	handle := &openTestBackend{statErr: ErrNotFound, lsErr: ErrNotFound}
+	driver := registerOpenTestBackend(t, &openTestDriver{handle: handle})
+	svc := newOpenTestSidecarService([]string{"open-s1"}, testOpenPolicy("client-a"))
+
+	_, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType: driver.name,
+		RootPath:    "/missing",
+		Mode:        pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if status.Code(err) == codes.OK {
+		t.Fatal("expected root verification error")
+	}
+	if handle.closedCount() != 1 {
+		t.Fatalf("closed=%d", handle.closedCount())
+	}
+	if len(svc.sessionManager.sessions) != 0 {
+		t.Fatalf("sessions=%+v", svc.sessionManager.sessions)
+	}
+}
+
+func TestOpenBackendInitFailureCreatesNoSession(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{initErr: ErrNotReachable})
+	svc := newOpenTestSidecarService([]string{"open-s1"}, testOpenPolicy("client-a"))
+
+	_, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType: driver.name,
+		RootPath:    "/work",
+		Mode:        pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if len(svc.sessionManager.sessions) != 0 {
+		t.Fatalf("sessions=%+v", svc.sessionManager.sessions)
+	}
+}
+
+func TestOpenCIDRPolicyRejectsDisallowedNetworkTargetBeforeInit(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	policies, err := parsePolicyConfig([]byte(`{
+	  "clients": [{
+	    "identity": "client-a",
+	    "host_cidrs": ["10.0.0.0/8"],
+	    "access_modes": ["read"],
+	    "lease": {"duration_seconds": 300, "idle_timeout_seconds": 60, "max_lifetime_seconds": 900}
+	  }]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := newOpenTestSidecarService([]string{"open-s1"}, policies)
+
+	_, err = svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType:   driver.name,
+		BackendParams: map[string]string{"hostname": "192.168.1.10"},
+		RootPath:      "/work",
+		Mode:          pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if driver.initCalls != 0 {
+		t.Fatalf("backend init was called %d times", driver.initCalls)
+	}
+}
+
+func TestOpenRedactedTargetInGetSessionAndListSessionsDoesNotLeakSecrets(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1"}, testOpenPolicy("client-a"))
+
+	_, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{
+		BackendType: driver.name,
+		BackendParams: map[string]string{
+			"url":           "https://user:secret-pass@example.com:8443/root?token=secret-token",
+			"password":      "secret-pass",
+			"token":         "secret-token",
+			"secret":        "secret-value",
+			"access-grant":  "grant-value",
+			"refresh_token": "refresh-value",
+		},
+		RootPath: "/work",
+		Mode:     pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := svc.GetSession(identityContext("client-a"), &pb.GetSessionRequest{SessionId: "open-s1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSafeRedactedTarget(t, info.GetRedactedTarget(), "example.com")
+
+	list, err := svc.ListSessions(identityContext("client-a"), &pb.ListSessionsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.GetSessions()) != 1 {
+		t.Fatalf("sessions=%+v", list.GetSessions())
+	}
+	assertSafeRedactedTarget(t, list.GetSessions()[0].GetRedactedTarget(), "example.com")
+}
+
+func TestOpenPerIdentityMaxSessionsRejectsResourceExhausted(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1", "open-s2"}, &policyEngine{clients: []clientPolicy{{
+		Identity:    "client-a",
+		AccessModes: []string{"read"},
+		MaxSessions: 1,
+		Lease:       leaseJSON{DurationSeconds: 300, IdleTimeoutSeconds: 60, MaxLifetimeSeconds: 900},
+	}}})
+
+	if _, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{BackendType: driver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{BackendType: driver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+}
+
+func TestOpenConcurrentPerIdentityMaxSessionsDoesNotInitializeSecondBackend(t *testing.T) {
+	initStarted := make(chan struct{}, 2)
+	releaseInit := make(chan struct{})
+	releaseOnce := sync.Once{}
+	defer releaseOnce.Do(func() { close(releaseInit) })
+
+	driver := registerOpenTestBackend(t, &openTestDriver{
+		initStarted: initStarted,
+		releaseInit: releaseInit,
+	})
+	svc := newOpenTestSidecarService([]string{"open-s1", "open-s2"}, &policyEngine{clients: []clientPolicy{{
+		Identity:    "client-a",
+		AccessModes: []string{"read"},
+		MaxSessions: 1,
+		Lease:       leaseJSON{DurationSeconds: 300, IdleTimeoutSeconds: 60, MaxLifetimeSeconds: 900},
+	}}})
+
+	errs := make(chan error, 2)
+	go func() {
+		_, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{BackendType: driver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ})
+		errs <- err
+	}()
+	waitOpenTestInitStarted(t, initStarted)
+
+	go func() {
+		_, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{BackendType: driver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ})
+		errs <- err
+	}()
+
+	secondInitialized := false
+	var successCount, exhaustedCount int
+	select {
+	case <-initStarted:
+		secondInitialized = true
+	case err := <-errs:
+		if status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("second open returned before first session was inserted with code=%s err=%v", status.Code(err), err)
+		}
+		exhaustedCount++
+	case <-time.After(time.Second):
+		t.Fatal("second open neither rejected nor initialized")
+	}
+
+	releaseOnce.Do(func() { close(releaseInit) })
+	for i := successCount + exhaustedCount; i < 2; i++ {
+		err := <-errs
+		switch status.Code(err) {
+		case codes.OK:
+			successCount++
+		case codes.ResourceExhausted:
+			exhaustedCount++
+		default:
+			t.Fatalf("unexpected open error code=%s err=%v", status.Code(err), err)
+		}
+	}
+
+	if secondInitialized {
+		t.Fatalf("second concurrent Open initialized backend before max_sessions admission; init_calls=%d", driver.initCallCount())
+	}
+	if successCount != 1 || exhaustedCount != 1 {
+		t.Fatalf("success=%d exhausted=%d", successCount, exhaustedCount)
+	}
+	if driver.initCallCount() != 1 {
+		t.Fatalf("init_calls=%d", driver.initCallCount())
+	}
+	if len(svc.sessionManager.sessions) != 1 {
+		t.Fatalf("sessions=%+v", svc.sessionManager.sessions)
+	}
+}
+
+func TestOpenCanceledDuringBackendInitReleasesReservationAndClosesEventualBackend(t *testing.T) {
+	initStarted := make(chan struct{}, 1)
+	releaseInit := make(chan struct{})
+	driver := registerOpenTestBackend(t, &openTestDriver{
+		initStarted: initStarted,
+		releaseInit: releaseInit,
+	})
+	nextDriver := registerNamedOpenTestBackend(t, uniqueOpenBackendName(t)+"-next", &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1", "open-s2"}, &policyEngine{clients: []clientPolicy{{
+		Identity:    "client-a",
+		AccessModes: []string{"read"},
+		MaxSessions: 1,
+		Lease:       leaseJSON{DurationSeconds: 300, IdleTimeoutSeconds: 60, MaxLifetimeSeconds: 900},
+	}}})
+
+	openCtx, cancelOpen := context.WithCancel(identityContext("client-a"))
+	errs := make(chan error, 1)
+	go func() {
+		_, err := svc.Open(openCtx, &pb.OpenRequest{BackendType: driver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ})
+		errs <- err
+	}()
+	waitOpenTestInitStarted(t, initStarted)
+
+	cancelOpen()
+	select {
+	case err := <-errs:
+		if status.Code(err) != codes.Canceled {
+			t.Fatalf("code=%s err=%v", status.Code(err), err)
+		}
+	case <-time.After(time.Second):
+		close(releaseInit)
+		t.Fatal("Open did not return after RPC context cancellation")
+	}
+
+	if _, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{BackendType: nextDriver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ}); err != nil {
+		close(releaseInit)
+		t.Fatalf("subsequent open should proceed after canceled reservation: %v", err)
+	}
+	close(releaseInit)
+	waitOpenTestEventually(t, func() bool { return driver.handle.closedCount() == 1 }, "eventual canceled backend close")
+	if len(svc.sessionManager.sessions) != 1 {
+		t.Fatalf("sessions=%+v", svc.sessionManager.sessions)
+	}
+}
+
+func TestOpenCanceledAfterBackendReadyBeforeSessionInsertCreatesNoSession(t *testing.T) {
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1"}, testOpenPolicy("client-a"))
+	openCtx, cancelOpen := context.WithCancel(identityContext("client-a"))
+	original := beforeOpenSessionInsert
+	beforeOpenSessionInsert = func(context.Context) { cancelOpen() }
+	t.Cleanup(func() { beforeOpenSessionInsert = original })
+
+	_, err := svc.Open(openCtx, &pb.OpenRequest{
+		BackendType: driver.name,
+		RootPath:    "/work",
+		Mode:        pb.AccessMode_ACCESS_MODE_READ,
+	})
+	if status.Code(err) != codes.Canceled {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if len(svc.sessionManager.sessions) != 0 {
+		t.Fatalf("sessions=%+v", svc.sessionManager.sessions)
+	}
+	if driver.handle.closedCount() != 1 {
+		t.Fatalf("closed=%d", driver.handle.closedCount())
+	}
+}
+
+func TestOpenGlobalPluginMaxSessionsRejectsResourceExhausted(t *testing.T) {
+	original := PluginMaxSessions
+	PluginMaxSessions = func() int { return 1 }
+	t.Cleanup(func() { PluginMaxSessions = original })
+
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1", "open-s2"}, testOpenPolicy("client-a", "client-b"))
+
+	if _, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{BackendType: driver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := svc.Open(identityContext("client-b"), &pb.OpenRequest{BackendType: driver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
 	}
 }
 
@@ -465,7 +1003,7 @@ func TestRemoveRejectsMutatingRootPath(t *testing.T) {
 	})
 
 	_, err := svc.Remove(identityContext("client-a"), &pb.RemoveRequest{SessionId: "s1", Path: "."})
-	if status.Code(err) != codes.PermissionDenied {
+	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("code=%s err=%v", status.Code(err), err)
 	}
 	if backend.rmPath != "" {
@@ -480,11 +1018,30 @@ func TestRenameRejectsTraversalDestination(t *testing.T) {
 	})
 
 	_, err := svc.Rename(identityContext("client-a"), &pb.RenameRequest{SessionId: "s1", From: "docs/report.txt", To: "../escape.txt"})
-	if status.Code(err) != codes.PermissionDenied {
+	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("code=%s err=%v", status.Code(err), err)
 	}
 	if backend.mvFrom != "" || backend.mvTo != "" {
 		t.Fatalf("mv was called from=%q to=%q", backend.mvFrom, backend.mvTo)
+	}
+}
+
+func TestListRejectsAbsoluteAndTraversalPathsAsInvalidArgument(t *testing.T) {
+	backend := &filesystemRPCBackend{}
+	svc := newTestSidecarService(t, nil, []openSessionInput{
+		testOpenInputWithBackend("client-a", "s1", backend),
+	})
+
+	for _, path := range []string{"/etc/passwd", "../escape"} {
+		t.Run(path, func(t *testing.T) {
+			_, err := svc.List(identityContext("client-a"), &pb.ListRequest{SessionId: "s1", Path: path})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("code=%s err=%v", status.Code(err), err)
+			}
+		})
+	}
+	if backend.lsPath != "" {
+		t.Fatalf("ls was called with path=%q", backend.lsPath)
 	}
 }
 
@@ -755,6 +1312,64 @@ func TestFilesystemOperationRequiresOwner(t *testing.T) {
 	}
 }
 
+func TestFilesystemOperationCloseWaitsForInFlightOperation(t *testing.T) {
+	backend := &filesystemRPCBackend{
+		lsStarted:   make(chan struct{}),
+		releaseLs:   make(chan struct{}),
+		closeCalled: make(chan struct{}),
+	}
+	svc := newTestSidecarService(t, nil, []openSessionInput{
+		testOpenInputWithBackend("client-a", "s1", backend),
+	})
+
+	listDone := make(chan error, 1)
+	go func() {
+		_, err := svc.List(identityContext("client-a"), &pb.ListRequest{SessionId: "s1", Path: "."})
+		listDone <- err
+	}()
+	waitOpenTestInitStarted(t, backend.lsStarted)
+
+	closeDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Close(identityContext("client-a"), &pb.CloseSessionRequest{SessionId: "s1"})
+		closeDone <- err
+	}()
+	waitOpenTestEventually(t, func() bool {
+		session := svc.sessionManager.sessions["s1"]
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.state == pb.SessionState_SESSION_STATE_CLOSED
+	}, "session close state")
+
+	select {
+	case <-backend.closeCalled:
+		t.Fatal("backend closed before in-flight list completed")
+	default:
+	}
+	close(backend.releaseLs)
+	if err := <-listDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	if backend.closed != 1 {
+		t.Fatalf("closed=%d", backend.closed)
+	}
+}
+
+func TestFilesystemOperationOnClosedSessionIsFailedPrecondition(t *testing.T) {
+	svc := newTestSidecarService(t, nil, []openSessionInput{testOpenInput("client-a", "s1")})
+	if _, err := svc.Close(identityContext("client-a"), &pb.CloseSessionRequest{SessionId: "s1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := svc.List(identityContext("client-a"), &pb.ListRequest{SessionId: "s1"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+}
+
 func TestFilesystemOperationMarksSessionUsedOnSuccess(t *testing.T) {
 	backend := &filesystemRPCBackend{statInfo: fakeInfo{name: "report.txt"}}
 	svc := newTestSidecarService(t, nil, []openSessionInput{
@@ -800,6 +1415,206 @@ func newTestSidecarService(t *testing.T, policies *policyEngine, inputs []openSe
 	return &sidecarService{sessionManager: m, policies: policies}
 }
 
+var openTestNow = time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
+
+func newOpenTestSidecarService(ids []string, policies *policyEngine) *sidecarService {
+	nextID := 0
+	m := newSessionManager(sessionManagerOptions{
+		now: func() time.Time { return openTestNow },
+		id: func() (string, error) {
+			id := ids[nextID]
+			nextID++
+			return id, nil
+		},
+	})
+	return &sidecarService{sessionManager: m, policies: policies}
+}
+
+func testOpenPolicy(identities ...string) *policyEngine {
+	clients := make([]clientPolicy, 0, len(identities))
+	for _, identity := range identities {
+		clients = append(clients, clientPolicy{
+			Identity:    identity,
+			AccessModes: []string{"read", "write"},
+			Lease: leaseJSON{
+				DurationSeconds:    900,
+				IdleTimeoutSeconds: 300,
+				MaxLifetimeSeconds: 3600,
+				Renewable:          true,
+			},
+		})
+	}
+	return &policyEngine{clients: clients}
+}
+
+func uniqueOpenBackendName(t *testing.T) string {
+	t.Helper()
+	replacer := strings.NewReplacer("/", "_", " ", "_")
+	return "test-open-" + replacer.Replace(t.Name())
+}
+
+func registerOpenTestBackend(t *testing.T, driver *openTestDriver) *openTestDriver {
+	t.Helper()
+	return registerNamedOpenTestBackend(t, uniqueOpenBackendName(t), driver)
+}
+
+func registerNamedOpenTestBackend(t *testing.T, name string, driver *openTestDriver) *openTestDriver {
+	t.Helper()
+	if driver == nil {
+		driver = &openTestDriver{}
+	}
+	driver.name = name
+	if driver.handle == nil {
+		driver.handle = &openTestBackend{statInfo: fakeInfo{name: "work", isDir: true, mode: os.ModeDir | 0o755}}
+	}
+	Backend.Register(driver.name, driver)
+	return driver
+}
+
+type openTestDriver struct {
+	Nothing
+
+	name         string
+	handle       *openTestBackend
+	initErr      error
+	initCalls    int
+	initParams   map[string]string
+	initCtx      context.Context
+	mutateParams bool
+	initStarted  chan struct{}
+	releaseInit  chan struct{}
+	mu           sync.Mutex
+}
+
+func (d *openTestDriver) Init(params map[string]string, app *App) (IBackend, error) {
+	d.mu.Lock()
+	d.initCalls++
+	d.initParams = copyTestStringMap(params)
+	if app == nil || app.Context == nil {
+		d.mu.Unlock()
+		return nil, ErrInternal
+	}
+	d.initCtx = app.Context
+	initStarted := d.initStarted
+	releaseInit := d.releaseInit
+	d.mu.Unlock()
+
+	if initStarted != nil {
+		initStarted <- struct{}{}
+	}
+	if releaseInit != nil {
+		<-releaseInit
+	}
+
+	if d.mutateParams {
+		params["mutated"] = "yes"
+	}
+	if d.initErr != nil {
+		return nil, d.initErr
+	}
+	return d.handle, nil
+}
+
+func (d *openTestDriver) initCallCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.initCalls
+}
+
+func waitOpenTestInitStarted(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for backend init")
+	}
+}
+
+func waitOpenTestEventually(t *testing.T, ok func() bool, label string) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if ok() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", label)
+		case <-tick.C:
+		}
+	}
+}
+
+func copyTestStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+type openTestBackend struct {
+	Nothing
+
+	statPath string
+	statInfo os.FileInfo
+	statErr  error
+	statNil  bool
+
+	lsPath    string
+	lsEntries []os.FileInfo
+	lsErr     error
+
+	closed int
+	mu     sync.Mutex
+}
+
+func (b *openTestBackend) Stat(path string) (os.FileInfo, error) {
+	b.statPath = path
+	if b.statErr != nil {
+		return nil, b.statErr
+	}
+	if b.statNil {
+		return nil, nil
+	}
+	return b.statInfo, nil
+}
+
+func (b *openTestBackend) Ls(path string) ([]os.FileInfo, error) {
+	b.lsPath = path
+	if b.lsErr != nil {
+		return nil, b.lsErr
+	}
+	return b.lsEntries, nil
+}
+
+func (b *openTestBackend) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed++
+	return nil
+}
+
+func (b *openTestBackend) closedCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closed
+}
+
+func assertSafeRedactedTarget(t *testing.T, got, wantContains string) {
+	t.Helper()
+	if !strings.Contains(got, wantContains) {
+		t.Fatalf("redacted_target=%q does not contain %q", got, wantContains)
+	}
+	for _, secret := range []string{"secret-pass", "secret-token", "secret-value", "grant-value", "refresh-value"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("redacted_target leaked %q: %q", secret, got)
+		}
+	}
+}
+
 func testOpenInput(owner, id string) openSessionInput {
 	return testOpenInputWithBackend(owner, id, &closeTrackingBackend{})
 }
@@ -826,6 +1641,8 @@ type filesystemRPCBackend struct {
 
 	lsPath    string
 	lsEntries []os.FileInfo
+	lsStarted chan struct{}
+	releaseLs chan struct{}
 
 	statPath string
 	statInfo os.FileInfo
@@ -844,10 +1661,19 @@ type filesystemRPCBackend struct {
 	savePath  string
 	savedData string
 	saveErr   error
+
+	closeCalled chan struct{}
+	closed      int
 }
 
 func (b *filesystemRPCBackend) Ls(path string) ([]os.FileInfo, error) {
 	b.lsPath = path
+	if b.lsStarted != nil {
+		close(b.lsStarted)
+	}
+	if b.releaseLs != nil {
+		<-b.releaseLs
+	}
 	return b.lsEntries, nil
 }
 
@@ -902,6 +1728,24 @@ func (b *filesystemRPCBackend) Save(path string, file io.Reader) error {
 	}
 	b.savedData = string(data)
 	return nil
+}
+
+func (b *filesystemRPCBackend) Close() error {
+	b.closed++
+	if b.closeCalled != nil {
+		close(b.closeCalled)
+	}
+	return nil
+}
+
+type closeErrorBackend struct {
+	Nothing
+	closed int
+}
+
+func (b *closeErrorBackend) Close() error {
+	b.closed++
+	return errors.New("close failed")
 }
 
 type closeTrackingReadCloser struct {

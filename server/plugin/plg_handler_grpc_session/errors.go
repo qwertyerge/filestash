@@ -8,9 +8,14 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+var ErrSessionInactive = errors.New("session is not active")
+
 func grpcError(err error) error {
 	if err == nil {
 		return nil
+	}
+	if _, ok := status.FromError(err); ok {
+		return err
 	}
 
 	code := codes.Internal
@@ -25,7 +30,7 @@ func grpcError(err error) error {
 		code = codes.AlreadyExists
 	case errors.Is(err, ErrNotValid):
 		code = codes.InvalidArgument
-	case errors.Is(err, ErrTimeout):
+	case errors.Is(err, ErrTimeout), errors.Is(err, ErrSessionInactive):
 		code = codes.FailedPrecondition
 	case errors.Is(err, ErrNotReachable), errors.Is(err, ErrFilesystemError):
 		code = codes.Unavailable

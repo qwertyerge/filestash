@@ -3,6 +3,7 @@ package plg_handler_grpc_session
 import (
 	"context"
 	"io"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -30,16 +31,17 @@ type sessionCaller struct {
 }
 
 type sessionSnapshot struct {
-	id            string
-	ownerIdentity string
-	backendType   string
-	rootPath      string
-	mode          pb.AccessMode
-	state         pb.SessionState
-	externalRef   externalRef
-	openedAt      time.Time
-	lastUsedAt    time.Time
-	lease         sessionLeaseState
+	id             string
+	ownerIdentity  string
+	backendType    string
+	rootPath       string
+	redactedTarget string
+	mode           pb.AccessMode
+	state          pb.SessionState
+	externalRef    externalRef
+	openedAt       time.Time
+	lastUsedAt     time.Time
+	lease          sessionLeaseState
 }
 
 func newSidecarService(sessions *sessionManager, policies *policyEngine) (*sidecarService, error) {
@@ -97,6 +99,115 @@ func (s *sidecarService) callerFromContext(ctx context.Context) (sessionCaller, 
 		identity: identity,
 		operator: policy.Role == "operator",
 	}, nil
+}
+
+func (s *sidecarService) Open(ctx context.Context, req *pb.OpenRequest) (*pb.OpenResponse, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	if s.policies == nil {
+		return nil, status.Error(codes.FailedPrecondition, "sidecar service requires policy engine")
+	}
+	caller, policy, err := s.openCallerPolicy(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	backendType := strings.TrimSpace(req.GetBackendType())
+	if backendType == "" {
+		return nil, status.Error(codes.InvalidArgument, "backend_type is required")
+	}
+	root, err := normalizedRootPath(req.GetRootPath())
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	driver, ok := Backend.Drivers()[backendType]
+	if !ok || driver == nil {
+		return nil, grpcError(ErrNotFound)
+	}
+
+	params := copyStringMap(req.GetBackendParams())
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	var backend IBackend
+	cleanup := func() {
+		sessionCancel()
+		if backend != nil {
+			closeBackend(backend)
+		}
+	}
+
+	effective, err := policy.effectiveOpen(openPolicyRequest{
+		backendType:   backendType,
+		backendParams: params,
+		mode:          req.GetMode(),
+		lease:         leaseRequestFromProto(req.GetLease()),
+	})
+	if err != nil {
+		cleanup()
+		return nil, grpcError(err)
+	}
+	reservation, err := s.reserveOpenAdmission(caller.identity, effective.maxSessions)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+
+	backendParams := copyStringMap(params)
+	backend, err = initAndVerifyBackend(ctx, driver, backendParams, sessionCtx, root)
+	if err != nil {
+		reservation.release()
+		cleanup()
+		return nil, grpcError(err)
+	}
+	if backend == nil {
+		reservation.release()
+		cleanup()
+		return nil, status.Error(codes.Internal, "backend init returned nil backend")
+	}
+
+	session, err := s.sessionManager.open(context.Background(), openSessionInput{
+		ownerIdentity:  caller.identity,
+		backendType:    backendType,
+		backend:        backend,
+		rootPath:       root,
+		redactedTarget: redactedTargetFromBackendParams(params),
+		mode:           effective.mode,
+		externalRef:    externalRefFromProto(req.GetExternalRef()),
+		lease:          effective.lease,
+		ctx:            sessionCtx,
+		cancel:         sessionCancel,
+		commitCtx:      ctx,
+		reservation:    reservation,
+	})
+	if err != nil {
+		reservation.release()
+		cleanup()
+		return nil, grpcError(err)
+	}
+	snapshot := snapshotSession(session, s.sessionManager.now())
+
+	return &pb.OpenResponse{
+		SessionId:     snapshot.id,
+		EffectiveMode: snapshot.mode,
+		Lease:         leaseToProto(snapshot.id, snapshot.lease),
+	}, nil
+}
+
+var beforeOpenSessionInsert = func(context.Context) {}
+
+func (s *sidecarService) openCallerPolicy(ctx context.Context) (sessionCaller, *clientPolicy, error) {
+	identity, err := identityFromContext(ctx)
+	if err != nil {
+		return sessionCaller{}, nil, err
+	}
+	policy, err := s.policies.policyFor(identity)
+	if err != nil {
+		return sessionCaller{}, nil, grpcError(err)
+	}
+	return sessionCaller{
+		identity: identity,
+		operator: policy.Role == "operator",
+	}, policy, nil
 }
 
 func (s *sidecarService) RenewSession(ctx context.Context, req *pb.RenewSessionRequest) (*pb.SessionLease, error) {
@@ -195,10 +306,11 @@ func (s *sidecarService) ForceClose(ctx context.Context, req *pb.ForceCloseReque
 }
 
 func (s *sidecarService) List(ctx context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
-	session, err := s.activeSession(ctx, req.GetSessionId())
+	session, release, err := s.activeSession(ctx, req.GetSessionId())
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	resolved, err := resolveSessionPath(session, req.GetPath(), pathUseRead)
 	if err != nil {
 		return nil, grpcError(err)
@@ -220,10 +332,11 @@ func (s *sidecarService) List(ctx context.Context, req *pb.ListRequest) (*pb.Lis
 }
 
 func (s *sidecarService) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error) {
-	session, err := s.activeSession(ctx, req.GetSessionId())
+	session, release, err := s.activeSession(ctx, req.GetSessionId())
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	resolved, err := resolveSessionPath(session, req.GetPath(), pathUseRead)
 	if err != nil {
 		return nil, grpcError(err)
@@ -244,10 +357,11 @@ func (s *sidecarService) ReadFile(req *pb.ReadFileRequest, stream pb.FilestashSi
 	if req.GetOffset() < 0 || req.GetLimit() < 0 {
 		return status.Error(codes.InvalidArgument, "offset and limit must be non-negative")
 	}
-	session, err := s.activeSession(stream.Context(), req.GetSessionId())
+	session, release, err := s.activeSession(stream.Context(), req.GetSessionId())
 	if err != nil {
 		return err
 	}
+	defer release()
 	resolved, err := resolveSessionPath(session, req.GetPath(), pathUseRead)
 	if err != nil {
 		return grpcError(err)
@@ -314,10 +428,11 @@ func (s *sidecarService) WriteFile(stream pb.FilestashSidecarService_WriteFileSe
 		return status.Error(codes.InvalidArgument, "expected_size must be non-negative")
 	}
 
-	session, err := s.activeSession(stream.Context(), header.GetSessionId())
+	session, release, err := s.activeSession(stream.Context(), header.GetSessionId())
 	if err != nil {
 		return err
 	}
+	defer release()
 	if !isWriteMode(session.mode) {
 		return status.Error(codes.FailedPrecondition, "session is read-only")
 	}
@@ -402,10 +517,11 @@ func parseWriteFileDataMessage(req *pb.WriteFileRequest) ([]byte, error) {
 }
 
 func (s *sidecarService) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MutationResponse, error) {
-	session, resolved, err := s.mutationTarget(ctx, req.GetSessionId(), req.GetPath())
+	session, release, resolved, err := s.mutationTarget(ctx, req.GetSessionId(), req.GetPath())
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if err := session.backend.Mkdir(resolved); err != nil {
 		return nil, grpcError(err)
 	}
@@ -414,10 +530,11 @@ func (s *sidecarService) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.M
 }
 
 func (s *sidecarService) Remove(ctx context.Context, req *pb.RemoveRequest) (*pb.MutationResponse, error) {
-	session, resolved, err := s.mutationTarget(ctx, req.GetSessionId(), req.GetPath())
+	session, release, resolved, err := s.mutationTarget(ctx, req.GetSessionId(), req.GetPath())
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if err := session.backend.Rm(resolved); err != nil {
 		return nil, grpcError(err)
 	}
@@ -426,10 +543,11 @@ func (s *sidecarService) Remove(ctx context.Context, req *pb.RemoveRequest) (*pb
 }
 
 func (s *sidecarService) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.MutationResponse, error) {
-	session, err := s.activeWritableSession(ctx, req.GetSessionId())
+	session, release, err := s.activeWritableSession(ctx, req.GetSessionId())
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	from, err := resolveSessionPath(session, req.GetFrom(), pathUseMutateChild)
 	if err != nil {
 		return nil, grpcError(err)
@@ -446,10 +564,11 @@ func (s *sidecarService) Rename(ctx context.Context, req *pb.RenameRequest) (*pb
 }
 
 func (s *sidecarService) Touch(ctx context.Context, req *pb.TouchRequest) (*pb.MutationResponse, error) {
-	session, resolved, err := s.mutationTarget(ctx, req.GetSessionId(), req.GetPath())
+	session, release, resolved, err := s.mutationTarget(ctx, req.GetSessionId(), req.GetPath())
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if err := session.backend.Touch(resolved); err != nil {
 		return nil, grpcError(err)
 	}
@@ -457,45 +576,47 @@ func (s *sidecarService) Touch(ctx context.Context, req *pb.TouchRequest) (*pb.M
 	return &pb.MutationResponse{Ok: true}, nil
 }
 
-func (s *sidecarService) activeSession(ctx context.Context, sessionID string) (*sidecarSession, error) {
+func (s *sidecarService) activeSession(ctx context.Context, sessionID string) (*sidecarSession, func(), error) {
 	if err := s.ready(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	caller, err := s.callerFromContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := validateSessionID(sessionID); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	session, err := s.sessionManager.get(caller.identity, caller.operator, sessionID)
+	session, release, err := s.sessionManager.acquire(caller.identity, caller.operator, sessionID)
 	if err != nil {
-		return nil, grpcError(err)
+		return nil, nil, grpcError(err)
 	}
-	return session, nil
+	return session, release, nil
 }
 
-func (s *sidecarService) activeWritableSession(ctx context.Context, sessionID string) (*sidecarSession, error) {
-	session, err := s.activeSession(ctx, sessionID)
+func (s *sidecarService) activeWritableSession(ctx context.Context, sessionID string) (*sidecarSession, func(), error) {
+	session, release, err := s.activeSession(ctx, sessionID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !isWriteMode(session.mode) {
-		return nil, status.Error(codes.FailedPrecondition, "session is read-only")
+		release()
+		return nil, nil, status.Error(codes.FailedPrecondition, "session is read-only")
 	}
-	return session, nil
+	return session, release, nil
 }
 
-func (s *sidecarService) mutationTarget(ctx context.Context, sessionID, inputPath string) (*sidecarSession, string, error) {
-	session, err := s.activeWritableSession(ctx, sessionID)
+func (s *sidecarService) mutationTarget(ctx context.Context, sessionID, inputPath string) (*sidecarSession, func(), string, error) {
+	session, release, err := s.activeWritableSession(ctx, sessionID)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
 	resolved, err := resolveSessionPath(session, inputPath, pathUseMutateChild)
 	if err != nil {
-		return nil, "", grpcError(err)
+		release()
+		return nil, nil, "", grpcError(err)
 	}
-	return session, resolved, nil
+	return session, release, resolved, nil
 }
 
 func resolveSessionPath(session *sidecarSession, input string, usage pathUse) (string, error) {
@@ -521,7 +642,7 @@ func (s *sidecarService) snapshotSessions(caller sessionCaller, includeClosed bo
 	out := make([]sessionSnapshot, 0, len(sessions))
 	for _, session := range sessions {
 		snapshot := snapshotSession(session, now)
-		if !includeClosed && snapshot.state == pb.SessionState_SESSION_STATE_CLOSED {
+		if !includeClosed && snapshot.state != pb.SessionState_SESSION_STATE_ACTIVE {
 			continue
 		}
 		out = append(out, snapshot)
@@ -529,6 +650,88 @@ func (s *sidecarService) snapshotSessions(caller sessionCaller, includeClosed bo
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].id < out[j].id
 	})
+	return out
+}
+
+func (s *sidecarService) reserveOpenAdmission(identity string, policyMaxSessions int) (*openReservation, error) {
+	return s.sessionManager.reserveOpen(identity, PluginMaxSessions(), policyMaxSessions)
+}
+
+func normalizedRootPath(root string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", ErrNotValid
+	}
+	resolver, err := newPathResolver(root)
+	if err != nil {
+		return "", err
+	}
+	return resolver.root, nil
+}
+
+func verifyBackendRoot(backend IBackend, root string) error {
+	info, statErr := backend.Stat(root)
+	if statErr == nil && info != nil {
+		return nil
+	}
+	if _, lsErr := backend.Ls(root); lsErr == nil {
+		return nil
+	} else if statErr != nil {
+		return statErr
+	} else {
+		return lsErr
+	}
+}
+
+type backendOpenResult struct {
+	backend IBackend
+	err     error
+}
+
+func initAndVerifyBackend(ctx context.Context, driver IBackend, params map[string]string, sessionCtx context.Context, root string) (IBackend, error) {
+	result := make(chan backendOpenResult, 1)
+	go func() {
+		backend, err := driver.Init(params, &App{Context: sessionCtx})
+		if err == nil {
+			if backend == nil {
+				err = status.Error(codes.Internal, "backend init returned nil backend")
+			} else if verifyErr := verifyBackendRoot(backend, root); verifyErr != nil {
+				err = grpcError(verifyErr)
+			}
+		} else {
+			err = grpcError(err)
+		}
+		result <- backendOpenResult{backend: backend, err: err}
+	}()
+
+	select {
+	case out := <-result:
+		if out.err != nil && out.backend != nil {
+			closeBackend(out.backend)
+			out.backend = nil
+		}
+		return out.backend, out.err
+	case <-ctx.Done():
+		go func() {
+			out := <-result
+			if out.backend != nil {
+				closeBackend(out.backend)
+			}
+		}()
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+}
+
+func closeBackend(backend IBackend) {
+	if closer, ok := backend.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
 	return out
 }
 
@@ -597,29 +800,62 @@ func sessionInfoToProto(in sessionSnapshot) *pb.SessionInfo {
 	}
 }
 
-func redactedTarget(sessionSnapshot) string {
+func redactedTarget(in sessionSnapshot) string {
+	return in.redactedTarget
+}
+
+func redactedTargetFromBackendParams(params map[string]string) string {
+	redacted := redactBackendParams(params)
+	for _, key := range []string{"hostname", "host", "endpoint", "url"} {
+		target := strings.TrimSpace(redacted[key])
+		if target == "" || target == "[REDACTED]" {
+			continue
+		}
+		if safe := safeTarget(target); safe != "" {
+			return safe
+		}
+	}
 	return ""
 }
 
+func safeTarget(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return ""
+	}
+	if u, err := url.Parse(target); err == nil && u.Host != "" {
+		return trimHost(u.Host)
+	}
+	if before, _, ok := strings.Cut(target, "?"); ok {
+		target = before
+	}
+	if before, _, ok := strings.Cut(target, "#"); ok {
+		target = before
+	}
+	if _, after, ok := strings.Cut(target, "@"); ok {
+		target = after
+	}
+	return trimHost(target)
+}
+
 func snapshotSession(s *sidecarSession, now time.Time) sessionSnapshot {
+	_, expired := s.stateAt(now)
+	if expired {
+		s.finalize()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state == pb.SessionState_SESSION_STATE_ACTIVE &&
-		(deadlineReached(now, s.expiresAt) ||
-			deadlineReached(now, s.idleExpiresAt) ||
-			deadlineReached(now, s.maxExpiresAt)) {
-		s.state = pb.SessionState_SESSION_STATE_EXPIRED
-	}
 	return sessionSnapshot{
-		id:            s.id,
-		ownerIdentity: s.ownerIdentity,
-		backendType:   s.backendType,
-		rootPath:      s.rootPath,
-		mode:          s.mode,
-		state:         s.state,
-		externalRef:   s.externalRef,
-		openedAt:      s.openedAt,
-		lastUsedAt:    s.lastUsedAt,
+		id:             s.id,
+		ownerIdentity:  s.ownerIdentity,
+		backendType:    s.backendType,
+		rootPath:       s.rootPath,
+		redactedTarget: s.redactedTarget,
+		mode:           s.mode,
+		state:          s.state,
+		externalRef:    s.externalRef,
+		openedAt:       s.openedAt,
+		lastUsedAt:     s.lastUsedAt,
 		lease: sessionLeaseState{
 			expiresAt:     s.expiresAt,
 			idleExpiresAt: s.idleExpiresAt,
