@@ -35,6 +35,7 @@ func redactBackendParams(in map[string]string) map[string]string {
 		lower := strings.ToLower(key)
 		if strings.Contains(lower, "pass") ||
 			strings.Contains(lower, "secret") ||
+			strings.Contains(lower, "refresh") ||
 			strings.Contains(lower, "token") ||
 			strings.Contains(lower, "key") ||
 			strings.Contains(lower, "credential") {

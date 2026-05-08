@@ -133,3 +133,19 @@ var PluginMaxStreamBytes = func() int64 {
 		return f
 	}).Int())
 }
+
+func init() {
+	Hooks.Register.Onload(func() {
+		PluginEnable()
+		PluginListenAddr()
+		PluginTLSCertFile()
+		PluginTLSKeyFile()
+		PluginTLSClientCAFile()
+		PluginPolicies()
+		PluginMaxSessions()
+		PluginDefaultLeaseSeconds()
+		PluginDefaultIdleTimeoutSeconds()
+		PluginDefaultMaxLifetimeSeconds()
+		PluginMaxStreamBytes()
+	})
+}
