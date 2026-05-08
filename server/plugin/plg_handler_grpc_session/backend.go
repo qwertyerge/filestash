@@ -33,12 +33,14 @@ func redactBackendParams(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
 	for key, value := range in {
 		lower := strings.ToLower(key)
+		normalized := strings.NewReplacer("-", "", "_", "", " ", "").Replace(lower)
 		if strings.Contains(lower, "pass") ||
 			strings.Contains(lower, "secret") ||
 			strings.Contains(lower, "refresh") ||
 			strings.Contains(lower, "token") ||
 			strings.Contains(lower, "key") ||
-			strings.Contains(lower, "credential") {
+			strings.Contains(lower, "credential") ||
+			strings.Contains(normalized, "accessgrant") {
 			out[key] = "[REDACTED]"
 			continue
 		}

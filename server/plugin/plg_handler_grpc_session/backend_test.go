@@ -93,11 +93,26 @@ func TestRedactBackendParams(t *testing.T) {
 		"access_key":      "ak",
 		"credential_file": "pem",
 		"refresh":         "rfr",
+		"access-grant":    "ag",
+		"access_grant":    "ag2",
+		"accessGrant":     "ag3",
 		"unrelated_data":  "value",
 	}
 
 	got := redactBackendParams(input)
-	for _, key := range []string{"password", "API_TOKEN", "pass_phrase", "Secret_Key", "privateKey", "access_key", "credential_file", "refresh"} {
+	for _, key := range []string{
+		"password",
+		"API_TOKEN",
+		"pass_phrase",
+		"Secret_Key",
+		"privateKey",
+		"access_key",
+		"credential_file",
+		"refresh",
+		"access-grant",
+		"access_grant",
+		"accessGrant",
+	} {
 		if got[key] == input[key] {
 			t.Fatalf("expected %s redacted", key)
 		}
