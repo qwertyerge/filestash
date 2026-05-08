@@ -40,6 +40,26 @@ type sessionSnapshot struct {
 	lease         sessionLeaseState
 }
 
+func newSidecarService(sessions *sessionManager, policies *policyEngine) (*sidecarService, error) {
+	if sessions == nil {
+		return nil, status.Error(codes.FailedPrecondition, "sidecar service requires session manager")
+	}
+	if policies == nil {
+		return nil, status.Error(codes.FailedPrecondition, "sidecar service requires policy engine")
+	}
+	return &sidecarService{
+		sessionManager: sessions,
+		policies:       policies,
+	}, nil
+}
+
+func (s *sidecarService) ready() error {
+	if s == nil || s.sessionManager == nil {
+		return status.Error(codes.FailedPrecondition, "sidecar service is not ready")
+	}
+	return nil
+}
+
 func identityFromContext(ctx context.Context) (string, error) {
 	p, ok := peer.FromContext(ctx)
 	if !ok || p == nil {
@@ -78,8 +98,14 @@ func (s *sidecarService) callerFromContext(ctx context.Context) (sessionCaller, 
 }
 
 func (s *sidecarService) RenewSession(ctx context.Context, req *pb.RenewSessionRequest) (*pb.SessionLease, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
 	caller, err := s.callerFromContext(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateSessionID(req.GetSessionId()); err != nil {
 		return nil, err
 	}
 	lease, err := s.sessionManager.renew(caller.identity, caller.operator, req.GetSessionId())
@@ -90,8 +116,14 @@ func (s *sidecarService) RenewSession(ctx context.Context, req *pb.RenewSessionR
 }
 
 func (s *sidecarService) Close(ctx context.Context, req *pb.CloseSessionRequest) (*pb.CloseSessionResponse, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
 	caller, err := s.callerFromContext(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateSessionID(req.GetSessionId()); err != nil {
 		return nil, err
 	}
 	if err := s.sessionManager.close(caller.identity, caller.operator, req.GetSessionId()); err != nil {
@@ -104,8 +136,14 @@ func (s *sidecarService) Close(ctx context.Context, req *pb.CloseSessionRequest)
 }
 
 func (s *sidecarService) GetSession(ctx context.Context, req *pb.GetSessionRequest) (*pb.SessionInfo, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
 	caller, err := s.callerFromContext(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateSessionID(req.GetSessionId()); err != nil {
 		return nil, err
 	}
 	session, err := s.sessionManager.lookup(caller.identity, caller.operator, req.GetSessionId())
@@ -116,6 +154,9 @@ func (s *sidecarService) GetSession(ctx context.Context, req *pb.GetSessionReque
 }
 
 func (s *sidecarService) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) (*pb.ListSessionsResponse, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
 	caller, err := s.callerFromContext(ctx)
 	if err != nil {
 		return nil, err
@@ -129,8 +170,14 @@ func (s *sidecarService) ListSessions(ctx context.Context, req *pb.ListSessionsR
 }
 
 func (s *sidecarService) ForceClose(ctx context.Context, req *pb.ForceCloseRequest) (*pb.CloseSessionResponse, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
 	caller, err := s.callerFromContext(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateSessionID(req.GetSessionId()); err != nil {
 		return nil, err
 	}
 	if !caller.operator {
@@ -169,6 +216,13 @@ func (s *sidecarService) snapshotSessions(caller sessionCaller, includeClosed bo
 		return out[i].id < out[j].id
 	})
 	return out
+}
+
+func validateSessionID(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return status.Error(codes.InvalidArgument, "session_id is required")
+	}
+	return nil
 }
 
 func leaseToProto(sessionID string, lease sessionLeaseState) *pb.SessionLease {

@@ -105,6 +105,54 @@ func TestForceCloseNonOperatorIsPermissionDenied(t *testing.T) {
 	}
 }
 
+func TestSidecarServiceRejectsBlankSessionID(t *testing.T) {
+	policies := testPolicyEngine(t, map[string]string{"operator": "operator"})
+	svc := newTestSidecarService(t, policies, nil)
+	ctx := identityContext("operator")
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "renew",
+			call: func() error {
+				_, err := svc.RenewSession(ctx, &pb.RenewSessionRequest{})
+				return err
+			},
+		},
+		{
+			name: "close",
+			call: func() error {
+				_, err := svc.Close(ctx, &pb.CloseSessionRequest{})
+				return err
+			},
+		},
+		{
+			name: "get",
+			call: func() error {
+				_, err := svc.GetSession(ctx, &pb.GetSessionRequest{})
+				return err
+			},
+		},
+		{
+			name: "force close",
+			call: func() error {
+				_, err := svc.ForceClose(ctx, &pb.ForceCloseRequest{})
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("code=%s err=%v", status.Code(err), err)
+			}
+		})
+	}
+}
+
 func TestGetSessionReturnsRedactedMetadataAndRejectsNonOwner(t *testing.T) {
 	svc := newTestSidecarService(t, nil, []openSessionInput{testOpenInput("client-a", "s1")})
 
@@ -175,11 +223,83 @@ func TestGrpcErrorMapsConflictToAlreadyExists(t *testing.T) {
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("code=%s err=%v", status.Code(err), err)
 	}
+	if status.Code(grpcError(ErrFilesystemError)) != codes.Unavailable {
+		t.Fatalf("filesystem code=%s", status.Code(grpcError(ErrFilesystemError)))
+	}
 	if grpcError(nil) != nil {
 		t.Fatal("nil error should map to nil")
 	}
 	if status.Code(grpcError(errors.New("boom"))) != codes.Internal {
 		t.Fatalf("default code=%s", status.Code(grpcError(errors.New("boom"))))
+	}
+}
+
+func TestSidecarServiceConstructorRequiresProductionDependencies(t *testing.T) {
+	sessions := newSessionManager(sessionManagerOptions{})
+	policies := testPolicyEngine(t, map[string]string{"operator": "operator"})
+
+	if _, err := newSidecarService(sessions, policies); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newSidecarService(nil, policies); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("nil sessions code=%s err=%v", status.Code(err), err)
+	}
+	if _, err := newSidecarService(sessions, nil); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("nil policies code=%s err=%v", status.Code(err), err)
+	}
+}
+
+func TestSidecarServiceRPCsRequireSessionManager(t *testing.T) {
+	svc := &sidecarService{}
+	ctx := identityContext("client-a")
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "renew",
+			call: func() error {
+				_, err := svc.RenewSession(ctx, &pb.RenewSessionRequest{SessionId: "s1"})
+				return err
+			},
+		},
+		{
+			name: "close",
+			call: func() error {
+				_, err := svc.Close(ctx, &pb.CloseSessionRequest{SessionId: "s1"})
+				return err
+			},
+		},
+		{
+			name: "get",
+			call: func() error {
+				_, err := svc.GetSession(ctx, &pb.GetSessionRequest{SessionId: "s1"})
+				return err
+			},
+		},
+		{
+			name: "list",
+			call: func() error {
+				_, err := svc.ListSessions(ctx, &pb.ListSessionsRequest{})
+				return err
+			},
+		},
+		{
+			name: "force close",
+			call: func() error {
+				_, err := svc.ForceClose(ctx, &pb.ForceCloseRequest{SessionId: "s1"})
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("code=%s err=%v", status.Code(err), err)
+			}
+		})
 	}
 }
 

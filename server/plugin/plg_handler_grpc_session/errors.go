@@ -23,11 +23,11 @@ func grpcError(err error) error {
 		code = codes.NotFound
 	case errors.Is(err, ErrConflict):
 		code = codes.AlreadyExists
-	case errors.Is(err, ErrNotValid), errors.Is(err, ErrFilesystemError):
+	case errors.Is(err, ErrNotValid):
 		code = codes.InvalidArgument
 	case errors.Is(err, ErrTimeout):
 		code = codes.FailedPrecondition
-	case errors.Is(err, ErrNotReachable):
+	case errors.Is(err, ErrNotReachable), errors.Is(err, ErrFilesystemError):
 		code = codes.Unavailable
 	}
 	return status.Error(code, err.Error())
