@@ -9,6 +9,7 @@ import (
 )
 
 var ErrSessionInactive = errors.New("session is not active")
+var ErrShuttingDown = errors.New("sidecar server is shutting down")
 
 func grpcError(err error) error {
 	if err == nil {
@@ -32,7 +33,7 @@ func grpcError(err error) error {
 		code = codes.InvalidArgument
 	case errors.Is(err, ErrTimeout), errors.Is(err, ErrSessionInactive):
 		code = codes.FailedPrecondition
-	case errors.Is(err, ErrNotReachable), errors.Is(err, ErrFilesystemError):
+	case errors.Is(err, ErrNotReachable), errors.Is(err, ErrFilesystemError), errors.Is(err, ErrShuttingDown):
 		code = codes.Unavailable
 	}
 	return status.Error(code, err.Error())

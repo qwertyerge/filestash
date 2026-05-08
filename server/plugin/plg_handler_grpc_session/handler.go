@@ -23,6 +23,8 @@ type sidecarService struct {
 
 	sessionManager *sessionManager
 	policies       *policyEngine
+	maxSessions    int
+	maxStreamBytes int64
 }
 
 type sessionCaller struct {
@@ -54,6 +56,8 @@ func newSidecarService(sessions *sessionManager, policies *policyEngine) (*sidec
 	return &sidecarService{
 		sessionManager: sessions,
 		policies:       policies,
+		maxSessions:    PluginMaxSessions(),
+		maxStreamBytes: PluginMaxStreamBytes(),
 	}, nil
 }
 
@@ -441,7 +445,7 @@ func (s *sidecarService) WriteFile(stream pb.FilestashSidecarService_WriteFileSe
 		return grpcError(err)
 	}
 
-	return s.writeFileStaged(stream, session, resolved, header.GetExpectedSize(), writeFileMaxBytes())
+	return s.writeFileStaged(stream, session, resolved, header.GetExpectedSize(), s.writeFileMaxBytes())
 }
 
 func (s *sidecarService) writeFileStaged(stream pb.FilestashSidecarService_WriteFileServer, session *sidecarSession, resolved string, expected int64, maxBytes int64) error {
@@ -494,10 +498,9 @@ func (s *sidecarService) writeFileStaged(stream pb.FilestashSidecarService_Write
 	return nil
 }
 
-func writeFileMaxBytes() int64 {
-	max := PluginMaxStreamBytes()
-	if max > 0 {
-		return max
+func (s *sidecarService) writeFileMaxBytes() int64 {
+	if s.maxStreamBytes > 0 {
+		return s.maxStreamBytes
 	}
 	return 1 << 30
 }
@@ -654,7 +657,7 @@ func (s *sidecarService) snapshotSessions(caller sessionCaller, includeClosed bo
 }
 
 func (s *sidecarService) reserveOpenAdmission(identity string, policyMaxSessions int) (*openReservation, error) {
-	return s.sessionManager.reserveOpen(identity, PluginMaxSessions(), policyMaxSessions)
+	return s.sessionManager.reserveOpen(identity, s.maxSessions, policyMaxSessions)
 }
 
 func normalizedRootPath(root string) (string, error) {

@@ -791,6 +791,31 @@ func TestOpenGlobalPluginMaxSessionsRejectsResourceExhausted(t *testing.T) {
 	}
 }
 
+func TestOpenUsesCachedGlobalMaxSessions(t *testing.T) {
+	original := PluginMaxSessions
+	calls := 0
+	PluginMaxSessions = func() int {
+		calls++
+		return 1
+	}
+	t.Cleanup(func() { PluginMaxSessions = original })
+
+	driver := registerOpenTestBackend(t, &openTestDriver{})
+	svc := newOpenTestSidecarService([]string{"open-s1", "open-s2"}, testOpenPolicy("client-a", "client-b"))
+	if calls != 1 {
+		t.Fatalf("PluginMaxSessions calls=%d", calls)
+	}
+	PluginMaxSessions = func() int { panic("PluginMaxSessions called after service construction") }
+
+	if _, err := svc.Open(identityContext("client-a"), &pb.OpenRequest{BackendType: driver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := svc.Open(identityContext("client-b"), &pb.OpenRequest{BackendType: driver.name, RootPath: "/work", Mode: pb.AccessMode_ACCESS_MODE_READ})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+}
+
 func TestSidecarServiceRPCsRequireSessionManager(t *testing.T) {
 	svc := &sidecarService{}
 	ctx := identityContext("client-a")
@@ -1279,6 +1304,37 @@ func TestWriteFileRejectsWhenStreamLimitExceededBeforeSave(t *testing.T) {
 	}
 }
 
+func TestWriteFileUsesCachedStreamLimit(t *testing.T) {
+	original := PluginMaxStreamBytes
+	calls := 0
+	PluginMaxStreamBytes = func() int64 {
+		calls++
+		return 4
+	}
+	t.Cleanup(func() { PluginMaxStreamBytes = original })
+
+	backend := &filesystemRPCBackend{}
+	svc := newTestSidecarService(t, nil, []openSessionInput{
+		testOpenInputWithBackend("client-a", "s1", backend),
+	})
+	if calls != 1 {
+		t.Fatalf("PluginMaxStreamBytes calls=%d", calls)
+	}
+	PluginMaxStreamBytes = func() int64 { panic("PluginMaxStreamBytes called after service construction") }
+
+	stream := newTestWriteFileStream(identityContext("client-a"), []*pb.WriteFileRequest{
+		writeFileHeader("s1", "out.txt", 0),
+		writeFileData("hello"),
+	})
+	err := svc.WriteFile(stream)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("code=%s err=%v", status.Code(err), err)
+	}
+	if backend.savePath != "" {
+		t.Fatalf("save was called with path=%q", backend.savePath)
+	}
+}
+
 func TestWriteFileMissingHeaderRejectsInvalidArgument(t *testing.T) {
 	backend := &filesystemRPCBackend{}
 	svc := newTestSidecarService(t, nil, []openSessionInput{
@@ -1412,7 +1468,12 @@ func newTestSidecarService(t *testing.T, policies *policyEngine, inputs []openSe
 			t.Fatal(err)
 		}
 	}
-	return &sidecarService{sessionManager: m, policies: policies}
+	return &sidecarService{
+		sessionManager: m,
+		policies:       policies,
+		maxSessions:    PluginMaxSessions(),
+		maxStreamBytes: PluginMaxStreamBytes(),
+	}
 }
 
 var openTestNow = time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
@@ -1427,7 +1488,12 @@ func newOpenTestSidecarService(ids []string, policies *policyEngine) *sidecarSer
 			return id, nil
 		},
 	})
-	return &sidecarService{sessionManager: m, policies: policies}
+	return &sidecarService{
+		sessionManager: m,
+		policies:       policies,
+		maxSessions:    PluginMaxSessions(),
+		maxStreamBytes: PluginMaxStreamBytes(),
+	}
 }
 
 func testOpenPolicy(identities ...string) *policyEngine {

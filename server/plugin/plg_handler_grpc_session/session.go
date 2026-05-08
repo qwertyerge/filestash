@@ -50,7 +50,9 @@ type sidecarSession struct {
 	state          pb.SessionState
 	ctx            context.Context
 	cancel         context.CancelFunc
-	ops            sync.WaitGroup
+	opsMu          sync.Mutex
+	opsCond        *sync.Cond
+	inFlightOps    int
 	closeOnce      sync.Once
 	mu             sync.Mutex
 }
@@ -80,6 +82,7 @@ type sessionManager struct {
 	sessions     map[string]*sidecarSession
 	pendingOwner map[string]int
 	pendingTotal int
+	shuttingDown bool
 	now          func() time.Time
 	id           func() (string, error)
 }
@@ -154,10 +157,18 @@ func (m *sessionManager) open(parent context.Context, in openSessionInput) (*sid
 		ctx:            ctx,
 		cancel:         cancel,
 	}
+	s.opsCond = sync.NewCond(&s.opsMu)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	beforeOpenSessionInsert(in.commitCtx)
+	if m.shuttingDown {
+		if in.reservation != nil {
+			in.reservation.releaseLocked()
+		}
+		cancel()
+		return nil, ErrShuttingDown
+	}
 	if in.commitCtx != nil && in.commitCtx.Err() != nil {
 		if in.reservation != nil {
 			in.reservation.releaseLocked()
@@ -212,15 +223,9 @@ func (m *sessionManager) acquire(caller string, operator bool, id string) (*side
 		s.mu.Unlock()
 		return nil, nil, ErrSessionInactive
 	}
-	s.ops.Add(1)
+	release := s.beginOperation()
 	s.mu.Unlock()
 
-	var once sync.Once
-	release := func() {
-		once.Do(func() {
-			s.ops.Done()
-		})
-	}
 	return s, release, nil
 }
 
@@ -301,6 +306,10 @@ func (m *sessionManager) activeCount(ownerIdentity string, now time.Time) int {
 func (m *sessionManager) reserveOpen(ownerIdentity string, globalMax, ownerMax int) (*openReservation, error) {
 	now := m.now()
 	m.mu.Lock()
+	if m.shuttingDown {
+		m.mu.Unlock()
+		return nil, ErrShuttingDown
+	}
 	activeGlobal := 0
 	activeOwner := 0
 	expired := []*sidecarSession{}
@@ -436,8 +445,66 @@ func (s *sidecarSession) finalize() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	s.waitForOps()
+	s.closeBackendOnce()
+}
+
+func (s *sidecarSession) beginOperation() func() {
+	s.opsMu.Lock()
+	s.inFlightOps++
+	s.opsMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.opsMu.Lock()
+			if s.inFlightOps > 0 {
+				s.inFlightOps--
+				if s.inFlightOps == 0 && s.opsCond != nil {
+					s.opsCond.Broadcast()
+				}
+			}
+			s.opsMu.Unlock()
+		})
+	}
+}
+
+func (s *sidecarSession) waitForOps() {
+	s.opsMu.Lock()
+	defer s.opsMu.Unlock()
+	for s.inFlightOps > 0 {
+		s.opsCond.Wait()
+	}
+}
+
+func (s *sidecarSession) waitForOpsUntil(deadline time.Time) bool {
+	for {
+		s.opsMu.Lock()
+		inFlight := s.inFlightOps
+		s.opsMu.Unlock()
+		if inFlight == 0 {
+			return true
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return false
+		}
+
+		sleep := 5 * time.Millisecond
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return false
+			}
+			if remaining < sleep {
+				sleep = remaining
+			}
+		}
+		time.Sleep(sleep)
+	}
+}
+
+func (s *sidecarSession) closeBackendOnce() {
 	s.closeOnce.Do(func() {
-		s.ops.Wait()
 		closeBackend(s.backend)
 	})
 }
