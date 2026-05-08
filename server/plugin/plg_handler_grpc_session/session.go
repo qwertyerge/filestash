@@ -43,8 +43,7 @@ type sidecarSession struct {
 	expiresAt     time.Time
 	idleExpiresAt time.Time
 	maxExpiresAt  time.Time
-	leaseOptions  effectiveLease
-	lease         sessionLeaseState
+	lease         effectiveLease
 	state         pb.SessionState
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -126,8 +125,7 @@ func (m *sessionManager) open(parent context.Context, in openSessionInput) (*sid
 		expiresAt:     lease.expiresAt,
 		idleExpiresAt: lease.idleExpiresAt,
 		maxExpiresAt:  lease.maxExpiresAt,
-		leaseOptions:  in.lease,
-		lease:         lease,
+		lease:         in.lease,
 		state:         pb.SessionState_SESSION_STATE_ACTIVE,
 		ctx:           ctx,
 		cancel:        cancel,
@@ -166,33 +164,38 @@ func (m *sessionManager) renew(caller string, operator bool, id string) (session
 	if s.state == pb.SessionState_SESSION_STATE_CLOSED {
 		return sessionLeaseState{}, ErrNotAllowed
 	}
-	if deadlineReached(now, s.expiresAt) || deadlineReached(now, s.maxExpiresAt) {
+	if deadlineReached(now, s.expiresAt) ||
+		deadlineReached(now, s.idleExpiresAt) ||
+		deadlineReached(now, s.maxExpiresAt) {
 		s.state = pb.SessionState_SESSION_STATE_EXPIRED
 		return sessionLeaseState{}, ErrTimeout
 	}
 	if s.state != pb.SessionState_SESSION_STATE_ACTIVE {
 		return sessionLeaseState{}, ErrNotAllowed
 	}
-	if !s.leaseOptions.renewable {
+	if !s.lease.renewable {
 		return sessionLeaseState{}, ErrNotAllowed
 	}
 
-	expiresAt := addDuration(now, s.leaseOptions.duration)
+	expiresAt := addDuration(now, s.lease.duration)
 	expiresAt = minDeadline(expiresAt, s.maxExpiresAt)
 	s.lastUsedAt = now
 	s.expiresAt = expiresAt
-	s.idleExpiresAt = addDuration(now, s.leaseOptions.idleTimeout)
-	s.lease = sessionLeaseState{
+	s.idleExpiresAt = addDuration(now, s.lease.idleTimeout)
+	return sessionLeaseState{
 		expiresAt:     s.expiresAt,
 		idleExpiresAt: s.idleExpiresAt,
 		maxExpiresAt:  s.maxExpiresAt,
-		renewable:     s.leaseOptions.renewable,
-	}
-	return s.lease, nil
+		renewable:     s.lease.renewable,
+	}, nil
 }
 
-func markUsed(s *sidecarSession) {
-	markUsedAt(s, time.Now())
+func (m *sessionManager) markUsed(s *sidecarSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := m.now()
+	s.lastUsedAt = now
+	s.idleExpiresAt = addDuration(now, s.lease.idleTimeout)
 }
 
 func (m *sessionManager) close(caller string, operator bool, id string) error {
@@ -253,14 +256,6 @@ func ensureActiveAt(s *sidecarSession, now time.Time) error {
 		return ErrNotAllowed
 	}
 	return nil
-}
-
-func markUsedAt(s *sidecarSession, now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lastUsedAt = now
-	s.idleExpiresAt = addDuration(now, s.leaseOptions.idleTimeout)
-	s.lease.idleExpiresAt = s.idleExpiresAt
 }
 
 func newSessionLeaseState(now time.Time, lease effectiveLease) sessionLeaseState {
