@@ -1,0 +1,198 @@
+syntax = "proto3";
+
+package filestash.sidecar.v1;
+
+option go_package = "github.com/mickael-kerjean/filestash/server/plugin/plg_handler_grpc_session/pb;pb";
+
+import "google/protobuf/timestamp.proto";
+
+service FilestashSidecarService {
+  rpc Open(OpenRequest) returns (OpenResponse);
+  rpc Close(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc RenewSession(RenewSessionRequest) returns (SessionLease);
+  rpc GetSession(GetSessionRequest) returns (SessionInfo);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc ForceClose(ForceCloseRequest) returns (CloseSessionResponse);
+
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileChunk);
+  rpc WriteFile(stream WriteFileRequest) returns (WriteFileResponse);
+  rpc Mkdir(MkdirRequest) returns (MutationResponse);
+  rpc Remove(RemoveRequest) returns (MutationResponse);
+  rpc Rename(RenameRequest) returns (MutationResponse);
+  rpc Touch(TouchRequest) returns (MutationResponse);
+}
+
+enum AccessMode {
+  ACCESS_MODE_UNSPECIFIED = 0;
+  ACCESS_MODE_READ = 1;
+  ACCESS_MODE_READ_WRITE = 2;
+}
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_ACTIVE = 1;
+  SESSION_STATE_CLOSED = 2;
+  SESSION_STATE_EXPIRED = 3;
+}
+
+message LeaseOptions {
+  uint32 duration_seconds = 1;
+  uint32 idle_timeout_seconds = 2;
+  uint32 max_lifetime_seconds = 3;
+  bool renewable = 4;
+}
+
+message SessionLease {
+  string session_id = 1;
+  google.protobuf.Timestamp expires_at = 2;
+  google.protobuf.Timestamp idle_expires_at = 3;
+  google.protobuf.Timestamp max_expires_at = 4;
+  bool renewable = 5;
+}
+
+message ExternalRef {
+  string kind = 1;
+  string id = 2;
+}
+
+message OpenRequest {
+  string backend_type = 1;
+  map<string, string> backend_params = 2;
+  string root_path = 3;
+  AccessMode mode = 4;
+  LeaseOptions lease = 5;
+  ExternalRef external_ref = 6;
+  map<string, string> client_metadata = 7;
+}
+
+message OpenResponse {
+  string session_id = 1;
+  AccessMode effective_mode = 2;
+  SessionLease lease = 3;
+}
+
+message CloseSessionRequest {
+  string session_id = 1;
+}
+
+message ForceCloseRequest {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message CloseSessionResponse {
+  string session_id = 1;
+  SessionState state = 2;
+}
+
+message RenewSessionRequest {
+  string session_id = 1;
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message ListSessionsRequest {
+  bool include_closed = 1;
+}
+
+message ListSessionsResponse {
+  repeated SessionInfo sessions = 1;
+}
+
+message SessionInfo {
+  string session_id = 1;
+  string owner_identity = 2;
+  string backend_type = 3;
+  string redacted_target = 4;
+  string root_path = 5;
+  AccessMode mode = 6;
+  SessionState state = 7;
+  ExternalRef external_ref = 8;
+  google.protobuf.Timestamp opened_at = 9;
+  google.protobuf.Timestamp last_used_at = 10;
+  SessionLease lease = 11;
+}
+
+message FileInfo {
+  string name = 1;
+  string type = 2;
+  int64 size = 3;
+  int64 mod_time_unix_ms = 4;
+  uint32 mode = 5;
+}
+
+message ListRequest {
+  string session_id = 1;
+  string path = 2;
+}
+
+message ListResponse {
+  repeated FileInfo files = 1;
+}
+
+message StatRequest {
+  string session_id = 1;
+  string path = 2;
+}
+
+message StatResponse {
+  FileInfo file = 1;
+}
+
+message ReadFileRequest {
+  string session_id = 1;
+  string path = 2;
+  int64 offset = 3;
+  int64 limit = 4;
+}
+
+message ReadFileChunk {
+  bytes data = 1;
+}
+
+message WriteFileRequest {
+  oneof payload {
+    WriteFileHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message WriteFileHeader {
+  string session_id = 1;
+  string path = 2;
+  bool overwrite = 3;
+  int64 expected_size = 4;
+}
+
+message WriteFileResponse {
+  int64 bytes_written = 1;
+}
+
+message MkdirRequest {
+  string session_id = 1;
+  string path = 2;
+}
+
+message RemoveRequest {
+  string session_id = 1;
+  string path = 2;
+}
+
+message RenameRequest {
+  string session_id = 1;
+  string from = 2;
+  string to = 3;
+}
+
+message TouchRequest {
+  string session_id = 1;
+  string path = 2;
+}
+
+message MutationResponse {
+  bool ok = 1;
+}
