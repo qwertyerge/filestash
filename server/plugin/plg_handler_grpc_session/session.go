@@ -523,8 +523,22 @@ func (s *sidecarSession) waitForOpsUntil(deadline time.Time) bool {
 
 func (s *sidecarSession) closeBackendOnce() {
 	s.closeOnce.Do(func() {
-		closeBackend(s.backend)
+		s.mu.Lock()
+		backend := s.backend
+		s.backend = nil
+		s.mu.Unlock()
+		closeBackend(backend)
 	})
+}
+
+func (s *sidecarSession) backendHandle() (IBackend, error) {
+	s.mu.Lock()
+	backend := s.backend
+	s.mu.Unlock()
+	if backend == nil {
+		return nil, ErrSessionInactive
+	}
+	return backend, nil
 }
 
 func finalizeExpiredSessions(sessions []*sidecarSession) {

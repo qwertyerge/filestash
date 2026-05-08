@@ -131,6 +131,9 @@ func TestSessionCloseIsIdempotentAndClosesBackend(t *testing.T) {
 	if backend.closed != 1 {
 		t.Fatalf("closed=%d", backend.closed)
 	}
+	if got := m.sessions["s1"].backend; got != nil {
+		t.Fatalf("backend reference retained after close: %#v", got)
+	}
 }
 
 func TestSidecarJanitorScanExpiresSessionsWithoutRPC(t *testing.T) {
@@ -206,6 +209,9 @@ func TestSidecarJanitorScanExpiresSessionsWithoutRPC(t *testing.T) {
 	for _, opened := range openedSessions {
 		if opened.backend.closed != 1 {
 			t.Fatalf("%s closed=%d", opened.session.id, opened.backend.closed)
+		}
+		if got := opened.session.backend; got != nil {
+			t.Fatalf("%s backend reference retained after expiry: %#v", opened.session.id, got)
 		}
 		if opened.ctx.Err() == nil {
 			t.Fatalf("%s context was not canceled", opened.session.id)

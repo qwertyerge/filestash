@@ -324,8 +324,12 @@ func (s *sidecarService) List(ctx context.Context, req *pb.ListRequest) (*pb.Lis
 	if err != nil {
 		return nil, grpcError(err)
 	}
+	backend, err := session.backendHandle()
+	if err != nil {
+		return nil, grpcError(err)
+	}
 
-	entries, err := session.backend.Ls(resolved)
+	entries, err := backend.Ls(resolved)
 	if err != nil {
 		return nil, grpcError(err)
 	}
@@ -350,8 +354,12 @@ func (s *sidecarService) Stat(ctx context.Context, req *pb.StatRequest) (*pb.Sta
 	if err != nil {
 		return nil, grpcError(err)
 	}
+	backend, err := session.backendHandle()
+	if err != nil {
+		return nil, grpcError(err)
+	}
 
-	info, err := session.backend.Stat(resolved)
+	info, err := backend.Stat(resolved)
 	if err != nil {
 		return nil, grpcError(err)
 	}
@@ -375,8 +383,12 @@ func (s *sidecarService) ReadFile(req *pb.ReadFileRequest, stream pb.FilestashSi
 	if err != nil {
 		return grpcError(err)
 	}
+	backend, err := session.backendHandle()
+	if err != nil {
+		return grpcError(err)
+	}
 
-	reader, err := session.backend.Cat(resolved)
+	reader, err := backend.Cat(resolved)
 	if err != nil {
 		return grpcError(err)
 	}
@@ -464,8 +476,12 @@ func (s *sidecarService) WriteFile(stream pb.FilestashSidecarService_WriteFileSe
 	if err != nil {
 		return grpcError(err)
 	}
+	backend, err := session.backendHandle()
+	if err != nil {
+		return grpcError(err)
+	}
 	if !header.GetOverwrite() {
-		info, err := session.backend.Stat(resolved)
+		info, err := backend.Stat(resolved)
 		if err != nil {
 			if !errors.Is(err, ErrNotFound) {
 				return grpcError(err)
@@ -475,10 +491,10 @@ func (s *sidecarService) WriteFile(stream pb.FilestashSidecarService_WriteFileSe
 		}
 	}
 
-	return s.writeFileStaged(stream, session, resolved, header.GetExpectedSize(), s.writeFileMaxBytes(session))
+	return s.writeFileStaged(stream, session, backend, resolved, header.GetExpectedSize(), s.writeFileMaxBytes(session))
 }
 
-func (s *sidecarService) writeFileStaged(stream pb.FilestashSidecarService_WriteFileServer, session *sidecarSession, resolved string, expected int64, maxBytes int64) error {
+func (s *sidecarService) writeFileStaged(stream pb.FilestashSidecarService_WriteFileServer, session *sidecarSession, backend IBackend, resolved string, expected int64, maxBytes int64) error {
 	staging, err := os.CreateTemp("", "filestash-sidecar-write-*")
 	if err != nil {
 		return status.Error(codes.Internal, err.Error())
@@ -516,7 +532,7 @@ func (s *sidecarService) writeFileStaged(stream pb.FilestashSidecarService_Write
 	if _, err := staging.Seek(0, io.SeekStart); err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
-	if err := session.backend.Save(resolved, staging); err != nil {
+	if err := backend.Save(resolved, staging); err != nil {
 		return grpcError(err)
 	}
 
@@ -533,10 +549,7 @@ func (s *sidecarService) readFileMaxBytes(session *sidecarSession) int64 {
 }
 
 func (s *sidecarService) writeFileMaxBytes(session *sidecarSession) int64 {
-	if maxBytes := s.sessionMaxStreamBytes(session); maxBytes > 0 {
-		return maxBytes
-	}
-	return 1 << 30
+	return s.sessionMaxStreamBytes(session)
 }
 
 func (s *sidecarService) sessionMaxStreamBytes(session *sidecarSession) int64 {
@@ -622,7 +635,11 @@ func (s *sidecarService) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.M
 		return nil, err
 	}
 	defer release()
-	if err := session.backend.Mkdir(resolved); err != nil {
+	backend, err := session.backendHandle()
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	if err := backend.Mkdir(resolved); err != nil {
 		return nil, grpcError(err)
 	}
 	s.sessionManager.markUsed(session)
@@ -635,7 +652,11 @@ func (s *sidecarService) Remove(ctx context.Context, req *pb.RemoveRequest) (*pb
 		return nil, err
 	}
 	defer release()
-	if err := session.backend.Rm(resolved); err != nil {
+	backend, err := session.backendHandle()
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	if err := backend.Rm(resolved); err != nil {
 		return nil, grpcError(err)
 	}
 	s.sessionManager.markUsed(session)
@@ -656,7 +677,11 @@ func (s *sidecarService) Rename(ctx context.Context, req *pb.RenameRequest) (*pb
 	if err != nil {
 		return nil, grpcError(err)
 	}
-	if err := session.backend.Mv(from, to); err != nil {
+	backend, err := session.backendHandle()
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	if err := backend.Mv(from, to); err != nil {
 		return nil, grpcError(err)
 	}
 	s.sessionManager.markUsed(session)
@@ -669,7 +694,11 @@ func (s *sidecarService) Touch(ctx context.Context, req *pb.TouchRequest) (*pb.M
 		return nil, err
 	}
 	defer release()
-	if err := session.backend.Touch(resolved); err != nil {
+	backend, err := session.backendHandle()
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	if err := backend.Touch(resolved); err != nil {
 		return nil, grpcError(err)
 	}
 	s.sessionManager.markUsed(session)

@@ -1544,6 +1544,20 @@ func TestWriteFileUsesCachedStreamLimit(t *testing.T) {
 	}
 }
 
+func TestWriteFileUnsetStreamLimitIsUnlimited(t *testing.T) {
+	backend := &filesystemRPCBackend{}
+	svc := newTestSidecarService(t, nil, []openSessionInput{
+		testOpenInputWithBackend("client-a", "s1", backend),
+	})
+	svc.maxStreamBytes = 0
+	session := svc.sessionManager.sessions["s1"]
+	session.maxStreamBytes = 0
+
+	if got := svc.writeFileMaxBytes(session); got != 0 {
+		t.Fatalf("write max bytes=%d want unlimited", got)
+	}
+}
+
 func TestWriteFileMissingHeaderRejectsInvalidArgument(t *testing.T) {
 	backend := &filesystemRPCBackend{}
 	svc := newTestSidecarService(t, nil, []openSessionInput{
