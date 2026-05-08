@@ -2,6 +2,8 @@ package plg_handler_grpc_session
 
 import (
 	"context"
+	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -190,6 +192,318 @@ func (s *sidecarService) ForceClose(ctx context.Context, req *pb.ForceCloseReque
 		SessionId: req.GetSessionId(),
 		State:     pb.SessionState_SESSION_STATE_CLOSED,
 	}, nil
+}
+
+func (s *sidecarService) List(ctx context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
+	session, err := s.activeSession(ctx, req.GetSessionId())
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := resolveSessionPath(session, req.GetPath(), pathUseRead)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+
+	entries, err := session.backend.Ls(resolved)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	out := &pb.ListResponse{Files: make([]*pb.FileInfo, 0, len(entries))}
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		out.Files = append(out.Files, fileInfoFromOS(entry))
+	}
+	s.sessionManager.markUsed(session)
+	return out, nil
+}
+
+func (s *sidecarService) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error) {
+	session, err := s.activeSession(ctx, req.GetSessionId())
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := resolveSessionPath(session, req.GetPath(), pathUseRead)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+
+	info, err := session.backend.Stat(resolved)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	if info == nil {
+		return nil, status.Error(codes.Internal, "backend returned nil file info")
+	}
+	s.sessionManager.markUsed(session)
+	return &pb.StatResponse{File: fileInfoFromOS(info)}, nil
+}
+
+func (s *sidecarService) ReadFile(req *pb.ReadFileRequest, stream pb.FilestashSidecarService_ReadFileServer) error {
+	if req.GetOffset() < 0 || req.GetLimit() < 0 {
+		return status.Error(codes.InvalidArgument, "offset and limit must be non-negative")
+	}
+	session, err := s.activeSession(stream.Context(), req.GetSessionId())
+	if err != nil {
+		return err
+	}
+	resolved, err := resolveSessionPath(session, req.GetPath(), pathUseRead)
+	if err != nil {
+		return grpcError(err)
+	}
+
+	reader, err := session.backend.Cat(resolved)
+	if err != nil {
+		return grpcError(err)
+	}
+	if reader == nil {
+		return status.Error(codes.Internal, "backend returned nil reader")
+	}
+	defer reader.Close()
+
+	if offset := req.GetOffset(); offset > 0 {
+		if _, err := io.CopyN(io.Discard, reader, offset); err != nil && err != io.EOF {
+			return grpcError(err)
+		}
+	}
+
+	buf := make([]byte, 32*1024)
+	remaining := req.GetLimit()
+	for {
+		readBuf := buf
+		if remaining > 0 && int64(len(readBuf)) > remaining {
+			readBuf = readBuf[:remaining]
+		}
+		n, err := reader.Read(readBuf)
+		if n > 0 {
+			if sendErr := stream.Send(&pb.ReadFileChunk{Data: append([]byte(nil), readBuf[:n]...)}); sendErr != nil {
+				return sendErr
+			}
+			if remaining > 0 {
+				remaining -= int64(n)
+				if remaining == 0 {
+					break
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return grpcError(err)
+		}
+	}
+	s.sessionManager.markUsed(session)
+	return nil
+}
+
+func (s *sidecarService) WriteFile(stream pb.FilestashSidecarService_WriteFileServer) error {
+	first, err := stream.Recv()
+	if err == io.EOF {
+		return status.Error(codes.InvalidArgument, "write file header is required")
+	}
+	if err != nil {
+		return err
+	}
+	header := first.GetHeader()
+	if header == nil {
+		return status.Error(codes.InvalidArgument, "first write file message must be a header")
+	}
+	if header.GetExpectedSize() < 0 {
+		return status.Error(codes.InvalidArgument, "expected_size must be non-negative")
+	}
+
+	session, err := s.activeSession(stream.Context(), header.GetSessionId())
+	if err != nil {
+		return err
+	}
+	if !isWriteMode(session.mode) {
+		return status.Error(codes.FailedPrecondition, "session is read-only")
+	}
+	resolved, err := resolveSessionPath(session, header.GetPath(), pathUseMutateChild)
+	if err != nil {
+		return grpcError(err)
+	}
+
+	return s.writeFileStaged(stream, session, resolved, header.GetExpectedSize(), writeFileMaxBytes())
+}
+
+func (s *sidecarService) writeFileStaged(stream pb.FilestashSidecarService_WriteFileServer, session *sidecarSession, resolved string, expected int64, maxBytes int64) error {
+	staging, err := os.CreateTemp("", "filestash-sidecar-write-*")
+	if err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	defer os.Remove(staging.Name())
+	defer staging.Close()
+
+	var written int64
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		data, err := parseWriteFileDataMessage(req)
+		if err != nil {
+			return err
+		}
+		written += int64(len(data))
+		if maxBytes > 0 && written > maxBytes {
+			return status.Errorf(codes.ResourceExhausted, "write stream exceeds max size %d", maxBytes)
+		}
+		if expected > 0 && written > expected {
+			return status.Errorf(codes.FailedPrecondition, "bytes written %d exceeds expected size %d", written, expected)
+		}
+		if _, err := staging.Write(data); err != nil {
+			return status.Error(codes.Internal, err.Error())
+		}
+	}
+	if expected > 0 && written != expected {
+		return status.Errorf(codes.FailedPrecondition, "bytes written %d does not match expected size %d", written, expected)
+	}
+	if _, err := staging.Seek(0, io.SeekStart); err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	if err := session.backend.Save(resolved, staging); err != nil {
+		return grpcError(err)
+	}
+
+	res := &pb.WriteFileResponse{BytesWritten: written}
+	if err := stream.SendAndClose(res); err != nil {
+		return err
+	}
+	s.sessionManager.markUsed(session)
+	return nil
+}
+
+func writeFileMaxBytes() int64 {
+	max := PluginMaxStreamBytes()
+	if max > 0 {
+		return max
+	}
+	return 1 << 30
+}
+
+func parseWriteFileDataMessage(req *pb.WriteFileRequest) ([]byte, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "write file data message is required")
+	}
+	switch payload := req.GetPayload().(type) {
+	case *pb.WriteFileRequest_Data:
+		return payload.Data, nil
+	case *pb.WriteFileRequest_Header:
+		return nil, status.Error(codes.InvalidArgument, "write file header may only be sent once")
+	default:
+		return nil, status.Error(codes.InvalidArgument, "write file data payload is required")
+	}
+}
+
+func (s *sidecarService) Mkdir(ctx context.Context, req *pb.MkdirRequest) (*pb.MutationResponse, error) {
+	session, resolved, err := s.mutationTarget(ctx, req.GetSessionId(), req.GetPath())
+	if err != nil {
+		return nil, err
+	}
+	if err := session.backend.Mkdir(resolved); err != nil {
+		return nil, grpcError(err)
+	}
+	s.sessionManager.markUsed(session)
+	return &pb.MutationResponse{Ok: true}, nil
+}
+
+func (s *sidecarService) Remove(ctx context.Context, req *pb.RemoveRequest) (*pb.MutationResponse, error) {
+	session, resolved, err := s.mutationTarget(ctx, req.GetSessionId(), req.GetPath())
+	if err != nil {
+		return nil, err
+	}
+	if err := session.backend.Rm(resolved); err != nil {
+		return nil, grpcError(err)
+	}
+	s.sessionManager.markUsed(session)
+	return &pb.MutationResponse{Ok: true}, nil
+}
+
+func (s *sidecarService) Rename(ctx context.Context, req *pb.RenameRequest) (*pb.MutationResponse, error) {
+	session, err := s.activeWritableSession(ctx, req.GetSessionId())
+	if err != nil {
+		return nil, err
+	}
+	from, err := resolveSessionPath(session, req.GetFrom(), pathUseMutateChild)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	to, err := resolveSessionPath(session, req.GetTo(), pathUseMutateChild)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	if err := session.backend.Mv(from, to); err != nil {
+		return nil, grpcError(err)
+	}
+	s.sessionManager.markUsed(session)
+	return &pb.MutationResponse{Ok: true}, nil
+}
+
+func (s *sidecarService) Touch(ctx context.Context, req *pb.TouchRequest) (*pb.MutationResponse, error) {
+	session, resolved, err := s.mutationTarget(ctx, req.GetSessionId(), req.GetPath())
+	if err != nil {
+		return nil, err
+	}
+	if err := session.backend.Touch(resolved); err != nil {
+		return nil, grpcError(err)
+	}
+	s.sessionManager.markUsed(session)
+	return &pb.MutationResponse{Ok: true}, nil
+}
+
+func (s *sidecarService) activeSession(ctx context.Context, sessionID string) (*sidecarSession, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	caller, err := s.callerFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSessionID(sessionID); err != nil {
+		return nil, err
+	}
+	session, err := s.sessionManager.get(caller.identity, caller.operator, sessionID)
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return session, nil
+}
+
+func (s *sidecarService) activeWritableSession(ctx context.Context, sessionID string) (*sidecarSession, error) {
+	session, err := s.activeSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if !isWriteMode(session.mode) {
+		return nil, status.Error(codes.FailedPrecondition, "session is read-only")
+	}
+	return session, nil
+}
+
+func (s *sidecarService) mutationTarget(ctx context.Context, sessionID, inputPath string) (*sidecarSession, string, error) {
+	session, err := s.activeWritableSession(ctx, sessionID)
+	if err != nil {
+		return nil, "", err
+	}
+	resolved, err := resolveSessionPath(session, inputPath, pathUseMutateChild)
+	if err != nil {
+		return nil, "", grpcError(err)
+	}
+	return session, resolved, nil
+}
+
+func resolveSessionPath(session *sidecarSession, input string, usage pathUse) (string, error) {
+	resolver, err := newPathResolver(session.rootPath)
+	if err != nil {
+		return "", err
+	}
+	return resolver.resolve(input, usage)
 }
 
 func (s *sidecarService) snapshotSessions(caller sessionCaller, includeClosed bool) []sessionSnapshot {
