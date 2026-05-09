@@ -1,0 +1,28 @@
+{
+  "general": {
+    "port": 8334
+  },
+  "features": {
+    "sidecar_grpc": {
+      "enable": true,
+      "listen_addr": "127.0.0.1:9443",
+      "tls": {
+        "cert_file": "conf/certs/server.crt",
+        "key_file": "conf/certs/server.key",
+        "client_ca_file": "conf/certs/client-ca.crt"
+      },
+      "policies": "{\"clients\":[{\"identity\":\"spiffe://filestash-sidecar/orchestrator\",\"role\":\"operator\",\"access_modes\":[\"read\",\"write\"],\"max_sessions\":32,\"lease\":{\"duration_seconds\":900,\"idle_timeout_seconds\":120,\"max_lifetime_seconds\":3600,\"renewable\":true},\"limits\":{\"max_stream_bytes\":1073741824}}]}",
+      "limits": {
+        "max_sessions": 128,
+        "default_lease_seconds": 900,
+        "default_idle_timeout_seconds": 120,
+        "default_max_lifetime_seconds": 3600,
+        "max_stream_bytes": 1073741824
+      }
+    }
+  },
+  "log": {
+    "level": "INFO"
+  },
+  "connections": []
+}
