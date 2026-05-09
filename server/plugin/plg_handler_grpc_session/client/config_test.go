@@ -119,6 +119,60 @@ func TestResolveOptionsExplicitFlagsOverrideConfig(t *testing.T) {
 	}
 }
 
+func TestResolveOptionsExplicitConfigKeepsPackageCertDefaults(t *testing.T) {
+	root := t.TempDir()
+	writeTempFile(t, filepath.Join(root, "conf", "config.json"), `{
+  "features": {
+    "sidecar_grpc": {
+      "listen_addr": "127.0.0.1:9444"
+    }
+  }
+}`)
+
+	got, err := ResolveOptions(Options{
+		WorkDir:    root,
+		ConfigFile: "conf/config.json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ClientCertFile != filepath.Join(root, "conf", "certs", "client.crt") {
+		t.Fatalf("ClientCertFile=%q", got.ClientCertFile)
+	}
+	if got.ClientKeyFile != filepath.Join(root, "conf", "certs", "client.key") {
+		t.Fatalf("ClientKeyFile=%q", got.ClientKeyFile)
+	}
+	if got.CAFile != filepath.Join(root, "conf", "certs", "client-ca.crt") {
+		t.Fatalf("CAFile=%q", got.CAFile)
+	}
+}
+
+func TestResolveOptionsParentConfigOnlyFromBinDirectory(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "scripts")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTempFile(t, filepath.Join(root, "conf", "config.json"), `{
+  "features": {
+    "sidecar_grpc": {
+      "listen_addr": "127.0.0.1:9444"
+    }
+  }
+}`)
+
+	got, err := ResolveOptions(Options{WorkDir: child})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConfigFile != "" {
+		t.Fatalf("ConfigFile=%q", got.ConfigFile)
+	}
+	if got.Addr != "127.0.0.1:9443" {
+		t.Fatalf("Addr=%q", got.Addr)
+	}
+}
+
 func TestResolveOptionsUsesFallbackAddressWithoutConfig(t *testing.T) {
 	got, err := ResolveOptions(Options{WorkDir: t.TempDir()})
 	if err != nil {
@@ -156,5 +210,61 @@ func TestResolveOptionsResolvesRelativeCAFromExplicitConfig(t *testing.T) {
 	}
 	if got.ConfigFile != filepath.Join(configDir, "config.json") {
 		t.Fatalf("ConfigFile=%q", got.ConfigFile)
+	}
+}
+
+func TestResolveOptionsFindsConfigFromFilestashPath(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(t.TempDir(), "state-root")
+	t.Setenv("FILESTASH_PATH", data)
+	writeTempFile(t, filepath.Join(data, "state", "config", "config.json"), `{
+  "features": {
+    "sidecar_grpc": {
+      "listen_addr": "127.0.0.1:9445",
+      "tls": {
+        "client_ca_file": "conf/certs/client-ca.crt"
+      }
+    }
+  }
+}`)
+
+	got, err := ResolveOptions(Options{WorkDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConfigFile != filepath.Join(data, "state", "config", "config.json") {
+		t.Fatalf("ConfigFile=%q", got.ConfigFile)
+	}
+	if got.Addr != "127.0.0.1:9445" {
+		t.Fatalf("Addr=%q", got.Addr)
+	}
+	if got.ClientCertFile != filepath.Join(root, "conf", "certs", "client.crt") {
+		t.Fatalf("ClientCertFile=%q", got.ClientCertFile)
+	}
+	if got.CAFile != filepath.Join(root, "conf", "certs", "client-ca.crt") {
+		t.Fatalf("CAFile=%q", got.CAFile)
+	}
+}
+
+func TestResolveOptionsRejectsMalformedExplicitConfig(t *testing.T) {
+	root := t.TempDir()
+	writeTempFile(t, filepath.Join(root, "conf", "config.json"), `{"features":`)
+
+	_, err := ResolveOptions(Options{
+		WorkDir:    root,
+		ConfigFile: "conf/config.json",
+	})
+	if err == nil {
+		t.Fatal("expected malformed explicit config to fail")
+	}
+}
+
+func TestResolveOptionsRejectsMalformedDiscoveredConfig(t *testing.T) {
+	root := t.TempDir()
+	writeTempFile(t, filepath.Join(root, "conf", "config.json"), `{"features":`)
+
+	_, err := ResolveOptions(Options{WorkDir: root})
+	if err == nil {
+		t.Fatal("expected malformed discovered config to fail")
 	}
 }

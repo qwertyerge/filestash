@@ -14,7 +14,7 @@ func TestWizardMovesFromBackendToParamsToOpen(t *testing.T) {
 		t.Fatalf("phase=%s", state.Phase)
 	}
 
-	state.SelectBackend("sftp")
+	state.SelectBackend(" SFTP ")
 	if state.Phase != PhaseParams {
 		t.Fatalf("phase=%s", state.Phase)
 	}
@@ -41,6 +41,23 @@ func TestWizardMovesFromBackendToParamsToOpen(t *testing.T) {
 	}
 }
 
+func TestOpenRequestRootPathIsTrimmedAbsoluteAndClean(t *testing.T) {
+	state := NewState()
+	state.SelectBackend("tmp")
+	state.CurrentPath = " a/b "
+
+	request := state.BuildOpenRequest()
+	if request.GetRootPath() != "/a/b" {
+		t.Fatalf("root=%q", request.GetRootPath())
+	}
+
+	state.CurrentPath = " /a/../b/ "
+	request = state.BuildOpenRequest()
+	if request.GetRootPath() != "/b" {
+		t.Fatalf("root=%q", request.GetRootPath())
+	}
+}
+
 func TestBrowserParentPathNavigation(t *testing.T) {
 	state := NewState()
 	state.CurrentPath = "/a/b"
@@ -53,6 +70,16 @@ func TestBrowserParentPathNavigation(t *testing.T) {
 	state.GoParent()
 	state.GoParent()
 	if state.CurrentPath != "/" {
+		t.Fatalf("path=%q", state.CurrentPath)
+	}
+}
+
+func TestBrowserParentPathNavigationNormalizesRelativePath(t *testing.T) {
+	state := NewState()
+	state.CurrentPath = "a/b"
+
+	state.GoParent()
+	if state.CurrentPath != "/a" {
 		t.Fatalf("path=%q", state.CurrentPath)
 	}
 }

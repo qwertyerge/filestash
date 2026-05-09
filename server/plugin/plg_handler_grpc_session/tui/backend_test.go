@@ -9,13 +9,14 @@ func TestBackendFieldsKnown(t *testing.T) {
 		backend string
 		fields  []string
 	}{
-		{"local", []string{"location"}},
-		{"tmp", nil},
-		{"sftp", []string{"hostname", "port", "username", "password"}},
-		{"ftp", []string{"hostname", "port", "username", "password"}},
-		{"webdav", []string{"url", "username", "password"}},
-		{"dav", []string{"url", "username", "password"}},
-		{"s3", []string{"endpoint", "region", "bucket", "access_key_id", "secret_access_key"}},
+		{"local", []string{"password"}},
+		{"tmp", []string{"userID"}},
+		{"sftp", []string{"hostname", "username", "password", "path", "port", "passphrase", "hostkey"}},
+		{"ftp", []string{"hostname", "username", "password", "path", "port", "conn"}},
+		{"webdav", []string{"url", "username", "password", "path"}},
+		{"s3", []string{"access_key_id", "secret_access_key", "region", "endpoint", "role_arn", "session_token", "path", "encryption_key", "number_thread", "timeout"}},
+		{"gdrive", []string{"token", "refresh", "expiry"}},
+		{"dropbox", []string{"access_token"}},
 	}
 
 	for _, tt := range tests {
@@ -42,7 +43,7 @@ func TestBackendFieldsDefaultBackendTypes(t *testing.T) {
 		t.Fatalf("DefaultBackendTypes must not be empty")
 	}
 
-	want := []string{"dav", "dropbox", "ftp", "gdrive", "local", "s3", "sftp", "tmp", "webdav"}
+	want := []string{"dropbox", "ftp", "gdrive", "local", "s3", "sftp", "tmp", "webdav"}
 	for _, b := range want {
 		found := false
 		for _, candidate := range DefaultBackendTypes {
@@ -57,6 +58,25 @@ func TestBackendFieldsDefaultBackendTypes(t *testing.T) {
 	}
 }
 
+func TestBackendFieldsDefaultBackendTypesHaveGuidedFields(t *testing.T) {
+	for _, backend := range DefaultBackendTypes {
+		if fields := BackendFields(backend); len(fields) == 0 {
+			t.Fatalf("BackendFields(%q) returned no guided fields", backend)
+		}
+	}
+}
+
+func TestBackendFieldsDoesNotAdvertiseUnregisteredDavAlias(t *testing.T) {
+	for _, backend := range DefaultBackendTypes {
+		if backend == "dav" {
+			t.Fatal("DefaultBackendTypes advertised unregistered dav backend")
+		}
+	}
+	if fields := BackendFields("dav"); len(fields) != 0 {
+		t.Fatalf("BackendFields(%q)=%v", "dav", fields)
+	}
+}
+
 func TestSensitiveFieldsAreDetected(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -68,6 +88,9 @@ func TestSensitiveFieldsAreDetected(t *testing.T) {
 		{"api_key", true},
 		{"access_key_id", true},
 		{"credential", true},
+		{"passphrase", true},
+		{"refresh", true},
+		{"access_grant", true},
 		{"client_certificate", false},
 		{"hostname", false},
 		{"username", false},

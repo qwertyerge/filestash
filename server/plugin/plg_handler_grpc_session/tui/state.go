@@ -64,7 +64,7 @@ func NewState() *State {
 }
 
 func (s *State) SelectBackend(backend string) {
-	s.BackendType = strings.TrimSpace(backend)
+	s.BackendType = strings.ToLower(strings.TrimSpace(backend))
 	s.Params = make(map[string]string)
 	s.Phase = PhaseParams
 }
@@ -82,14 +82,7 @@ func (s *State) BuildOpenRequest() *pb.OpenRequest {
 		params[key] = value
 	}
 
-	rootPath := s.CurrentPath
-	if rootPath == "" {
-		rootPath = "/"
-	}
-	rootPath = path.Clean(rootPath)
-	if rootPath == "." {
-		rootPath = "/"
-	}
+	rootPath := normalizeAbsolutePath(s.CurrentPath)
 
 	request := &pb.OpenRequest{
 		BackendType:   s.BackendType,
@@ -112,7 +105,7 @@ func (s *State) BuildOpenRequest() *pb.OpenRequest {
 }
 
 func (s *State) GoParent() {
-	clean := path.Clean(strings.TrimSpace(s.CurrentPath))
+	clean := normalizeAbsolutePath(s.CurrentPath)
 	if clean == "." || clean == "/" {
 		s.CurrentPath = "/"
 		return
@@ -125,6 +118,21 @@ func (s *State) GoParent() {
 	}
 
 	s.CurrentPath = parent
+}
+
+func normalizeAbsolutePath(input string) string {
+	clean := strings.TrimSpace(input)
+	if clean == "" {
+		return "/"
+	}
+	if !path.IsAbs(clean) {
+		clean = "/" + clean
+	}
+	clean = path.Clean(clean)
+	if clean == "." {
+		return "/"
+	}
+	return clean
 }
 
 func (s *State) CanMutate(action Action) bool {

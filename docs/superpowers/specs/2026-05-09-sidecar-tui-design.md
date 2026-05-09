@@ -103,17 +103,19 @@ The TUI package should not import Filestash server internals other than the side
 
 The TUI presents a backend type selector first. Known backends get guided parameter prompts:
 
-- `local`: `location`
-- `tmp`: no required params
-- `sftp`: `hostname`, `port`, `username`, `password` or key-related params when supplied manually
-- `ftp`: `hostname`, `port`, `username`, `password`
-- `webdav`/`dav`: `url`, `username`, `password`
-- `s3`: `endpoint`, `region`, `bucket`, `access_key_id`, `secret_access_key`
-- `gdrive`, `dropbox`, and other registered backends: generic key/value editor
+- `local`: `password`
+- `tmp`: `userID`
+- `sftp`: `hostname`, `username`, `password`, `path`, `port`, `passphrase`, `hostkey`
+- `ftp`: `hostname`, `username`, `password`, `path`, `port`, `conn`
+- `webdav`: `url`, `username`, `password`, `path`
+- `s3`: `access_key_id`, `secret_access_key`, `region`, `endpoint`, `role_arn`, `session_token`, `path`, `encryption_key`, `number_thread`, `timeout`
+- `gdrive`: `token`, `refresh`, `expiry`
+- `dropbox`: `access_token`
+- other registered backends: generic key/value editor
 
 Unknown backend types remain supported through a generic key/value editor because the sidecar service accepts any backend registered in the server binary.
 
-Sensitive field names such as `password`, `secret`, `token`, `key`, and `credential` are masked in the UI.
+Sensitive field names such as `password`, `passphrase`, `secret`, `token`, `key`, `credential`, `refresh`, and `access_grant` are masked in the UI.
 
 Open options:
 

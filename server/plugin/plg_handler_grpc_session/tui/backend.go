@@ -13,7 +13,6 @@ var DefaultBackendTypes = []string{
 	"sftp",
 	"ftp",
 	"webdav",
-	"dav",
 	"s3",
 	"gdrive",
 	"dropbox",
@@ -22,33 +21,33 @@ var DefaultBackendTypes = []string{
 func BackendFields(backend string) []Field {
 	switch strings.ToLower(strings.TrimSpace(backend)) {
 	case "local":
-		return []Field{{Name: "location", Sensitive: IsSensitiveField("location")}}
+		return fields("password")
 	case "tmp":
-		return nil
+		return fields("userID")
 	case "sftp", "ftp":
-		return []Field{
-			{Name: "hostname", Sensitive: IsSensitiveField("hostname")},
-			{Name: "port", Sensitive: IsSensitiveField("port")},
-			{Name: "username", Sensitive: IsSensitiveField("username")},
-			{Name: "password", Sensitive: IsSensitiveField("password")},
+		if strings.EqualFold(strings.TrimSpace(backend), "sftp") {
+			return fields("hostname", "username", "password", "path", "port", "passphrase", "hostkey")
 		}
-	case "webdav", "dav":
-		return []Field{
-			{Name: "url", Sensitive: IsSensitiveField("url")},
-			{Name: "username", Sensitive: IsSensitiveField("username")},
-			{Name: "password", Sensitive: IsSensitiveField("password")},
-		}
+		return fields("hostname", "username", "password", "path", "port", "conn")
+	case "webdav":
+		return fields("url", "username", "password", "path")
 	case "s3":
-		return []Field{
-			{Name: "endpoint", Sensitive: IsSensitiveField("endpoint")},
-			{Name: "region", Sensitive: IsSensitiveField("region")},
-			{Name: "bucket", Sensitive: IsSensitiveField("bucket")},
-			{Name: "access_key_id", Sensitive: IsSensitiveField("access_key_id")},
-			{Name: "secret_access_key", Sensitive: IsSensitiveField("secret_access_key")},
-		}
+		return fields("access_key_id", "secret_access_key", "region", "endpoint", "role_arn", "session_token", "path", "encryption_key", "number_thread", "timeout")
+	case "gdrive":
+		return fields("token", "refresh", "expiry")
+	case "dropbox":
+		return fields("access_token")
 	default:
 		return nil
 	}
+}
+
+func fields(names ...string) []Field {
+	out := make([]Field, 0, len(names))
+	for _, name := range names {
+		out = append(out, Field{Name: name, Sensitive: IsSensitiveField(name)})
+	}
+	return out
 }
 
 func IsSensitiveField(name string) bool {
@@ -58,8 +57,11 @@ func IsSensitiveField(name string) bool {
 	normalized = strings.ReplaceAll(normalized, " ", "")
 
 	return strings.Contains(normalized, "password") ||
+		strings.Contains(normalized, "pass") ||
 		strings.Contains(normalized, "secret") ||
 		strings.Contains(normalized, "token") ||
 		strings.Contains(normalized, "key") ||
-		strings.Contains(normalized, "credential")
+		strings.Contains(normalized, "credential") ||
+		strings.Contains(normalized, "refresh") ||
+		strings.Contains(normalized, "grant")
 }

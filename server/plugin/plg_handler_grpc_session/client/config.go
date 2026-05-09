@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,8 @@ type Options struct {
 type discoveredConfig struct {
 	path        string
 	packageRoot string
+	configDir   string
+	caBaseDir   string
 	listenAddr  string
 	clientCA    string
 }
@@ -54,7 +57,7 @@ func ResolveOptions(in Options) (Options, error) {
 	}
 	if opts.CAFile == "" {
 		if discovered.clientCA != "" {
-			opts.CAFile = resolveRelativePath(discovered.packageRoot, discovered.clientCA)
+			opts.CAFile = resolveRelativePath(discovered.caBaseDir, discovered.clientCA)
 		} else {
 			opts.CAFile = filepath.Join(discovered.packageRoot, "conf", "certs", "client-ca.crt")
 		}
@@ -81,7 +84,9 @@ func discoverConfig(opts Options) (discoveredConfig, error) {
 
 		return discoveredConfig{
 			path:        cfgPath,
-			packageRoot: filepath.Dir(cfgPath),
+			packageRoot: defaultPackageRoot(opts.WorkDir),
+			configDir:   filepath.Dir(cfgPath),
+			caBaseDir:   filepath.Dir(cfgPath),
 			listenAddr:  listenAddr,
 			clientCA:    clientCA,
 		}, nil
@@ -99,6 +104,8 @@ func discoverConfig(opts Options) (discoveredConfig, error) {
 		return discoveredConfig{
 			path:        candidate.path,
 			packageRoot: candidate.root,
+			configDir:   filepath.Dir(candidate.path),
+			caBaseDir:   candidate.root,
 			listenAddr:  listenAddr,
 			clientCA:    clientCA,
 		}, nil
@@ -106,6 +113,8 @@ func discoverConfig(opts Options) (discoveredConfig, error) {
 
 	return discoveredConfig{
 		packageRoot: opts.WorkDir,
+		configDir:   opts.WorkDir,
+		caBaseDir:   opts.WorkDir,
 	}, nil
 }
 
@@ -125,10 +134,15 @@ func discoverConfigCandidates(workDir string) []struct {
 			path: filepath.Join(workDir, "data", "state", "config", "config.json"),
 			root: workDir,
 		},
-		{
+	}
+	if filepath.Base(workDir) == "bin" {
+		candidates = append(candidates, struct {
+			path string
+			root string
+		}{
 			path: filepath.Join(filepath.Dir(workDir), "conf", "config.json"),
 			root: filepath.Dir(workDir),
-		},
+		})
 	}
 
 	if fp := os.Getenv("FILESTASH_PATH"); fp != "" {
@@ -137,7 +151,7 @@ func discoverConfigCandidates(workDir string) []struct {
 			root string
 		}{
 			path: filepath.Join(fp, "state", "config", "config.json"),
-			root: fp,
+			root: defaultPackageRoot(workDir),
 		})
 	}
 
@@ -148,6 +162,9 @@ func loadConfig(path string) (string, string, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return "", "", err
+	}
+	if !json.Valid(content) {
+		return "", "", fmt.Errorf("invalid sidecar config JSON: %s", path)
 	}
 
 	listenAddr := gjson.GetBytes(content, "features.sidecar_grpc.listen_addr").String()
@@ -185,4 +202,11 @@ func discoveredRoot(opts Options, cfg discoveredConfig) string {
 		return cfg.packageRoot
 	}
 	return opts.WorkDir
+}
+
+func defaultPackageRoot(workDir string) string {
+	if filepath.Base(workDir) == "bin" {
+		return filepath.Dir(workDir)
+	}
+	return workDir
 }
