@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -28,15 +29,14 @@ func TestUnaryMethodsConstructRequestsAndReturnGeneratedResponses(t *testing.T) 
 		t.Fatalf("open response/request mismatch")
 	}
 
-	closeResp, err := client.Close(ctx, "s1")
-	if err != nil {
+	if err := client.Close(ctx, "s1"); err != nil {
 		t.Fatal(err)
 	}
-	if closeResp != fake.closeResp || fake.closeReq.GetSessionId() != "s1" {
-		t.Fatalf("close response/request mismatch")
+	if fake.closeReq.GetSessionId() != "s1" {
+		t.Fatalf("close request mismatch")
 	}
 
-	lease, err := client.RenewSession(ctx, "s1")
+	lease, err := client.Renew(ctx, "s1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,64 +56,59 @@ func TestUnaryMethodsConstructRequestsAndReturnGeneratedResponses(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sessions != fake.listSessionsResp || !fake.listSessionsReq.GetIncludeClosed() {
+	if sessions != nil || !fake.listSessionsReq.GetIncludeClosed() {
 		t.Fatalf("list sessions response/request mismatch")
 	}
 
-	forceResp, err := client.ForceClose(ctx, "s1", "operator")
-	if err != nil {
+	if err := client.ForceClose(ctx, "s1", "operator"); err != nil {
 		t.Fatal(err)
 	}
-	if forceResp != fake.forceResp || fake.forceReq.GetSessionId() != "s1" || fake.forceReq.GetReason() != "operator" {
-		t.Fatalf("force close response/request mismatch")
+	if fake.forceReq.GetSessionId() != "s1" || fake.forceReq.GetReason() != "operator" {
+		t.Fatalf("force close request mismatch")
 	}
 
-	listResp, err := client.List(ctx, "s1", "/")
+	listFiles, err := client.List(ctx, "s1", "/")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if listResp != fake.listResp || fake.listReq.GetSessionId() != "s1" || fake.listReq.GetPath() != "/" {
+	if len(listFiles) != 0 || fake.listReq.GetSessionId() != "s1" || fake.listReq.GetPath() != "/" {
 		t.Fatalf("list response/request mismatch")
 	}
 
-	statResp, err := client.Stat(ctx, "s1", "note.txt")
+	statFile, err := client.Stat(ctx, "s1", "note.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if statResp != fake.statResp || fake.statReq.GetSessionId() != "s1" || fake.statReq.GetPath() != "note.txt" {
+	if statFile.GetName() != "note.txt" || fake.statReq.GetSessionId() != "s1" || fake.statReq.GetPath() != "note.txt" {
 		t.Fatalf("stat response/request mismatch")
 	}
 
-	mkdirResp, err := client.Mkdir(ctx, "s1", "new")
-	if err != nil {
+	if err := client.Mkdir(ctx, "s1", "new"); err != nil {
 		t.Fatal(err)
 	}
-	if mkdirResp != fake.mkdirResp || fake.mkdirReq.GetSessionId() != "s1" || fake.mkdirReq.GetPath() != "new" {
-		t.Fatalf("mkdir response/request mismatch")
+	if fake.mkdirReq.GetSessionId() != "s1" || fake.mkdirReq.GetPath() != "new" {
+		t.Fatalf("mkdir request mismatch")
 	}
 
-	removeResp, err := client.Remove(ctx, "s1", "old")
-	if err != nil {
+	if err := client.Remove(ctx, "s1", "old"); err != nil {
 		t.Fatal(err)
 	}
-	if removeResp != fake.removeResp || fake.removeReq.GetSessionId() != "s1" || fake.removeReq.GetPath() != "old" {
-		t.Fatalf("remove response/request mismatch")
+	if fake.removeReq.GetSessionId() != "s1" || fake.removeReq.GetPath() != "old" {
+		t.Fatalf("remove request mismatch")
 	}
 
-	renameResp, err := client.Rename(ctx, "s1", "old", "new")
-	if err != nil {
+	if err := client.Rename(ctx, "s1", "old", "new"); err != nil {
 		t.Fatal(err)
 	}
-	if renameResp != fake.renameResp || fake.renameReq.GetSessionId() != "s1" || fake.renameReq.GetFrom() != "old" || fake.renameReq.GetTo() != "new" {
-		t.Fatalf("rename response/request mismatch")
+	if fake.renameReq.GetSessionId() != "s1" || fake.renameReq.GetFrom() != "old" || fake.renameReq.GetTo() != "new" {
+		t.Fatalf("rename request mismatch")
 	}
 
-	touchResp, err := client.Touch(ctx, "s1", "note.txt")
-	if err != nil {
+	if err := client.Touch(ctx, "s1", "note.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if touchResp != fake.touchResp || fake.touchReq.GetSessionId() != "s1" || fake.touchReq.GetPath() != "note.txt" {
-		t.Fatalf("touch response/request mismatch")
+	if fake.touchReq.GetSessionId() != "s1" || fake.touchReq.GetPath() != "note.txt" {
+		t.Fatalf("touch request mismatch")
 	}
 }
 
@@ -138,7 +133,7 @@ func TestWriteFileSendsHeaderAndChunks(t *testing.T) {
 	fake := &fakeGeneratedClient{}
 	client := NewFromGenerated(fake)
 
-	written, err := client.WriteFile(context.Background(), "s1", "out.txt", strings.NewReader("hello"), false, 5)
+	written, err := client.WriteFile(context.Background(), "s1", "out.txt", strings.NewReader("hello"), 5, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,9 +160,44 @@ func TestWriteFileReturnsConflictForCallerControlledRetry(t *testing.T) {
 	fake := &fakeGeneratedClient{writeErr: status.Error(codes.AlreadyExists, "exists")}
 	client := NewFromGenerated(fake)
 
-	_, err := client.WriteFile(context.Background(), "s1", "out.txt", strings.NewReader("hello"), false, 5)
+	_, err := client.WriteFile(context.Background(), "s1", "out.txt", strings.NewReader("hello"), 5, false)
 	if status.Code(err) != codes.AlreadyExists {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestWriteFileReturnsCloseStatusAfterSendError(t *testing.T) {
+	fake := &fakeGeneratedClient{
+		writeSendErr: io.ErrClosedPipe,
+		writeErr:     status.Error(codes.AlreadyExists, "exists"),
+	}
+	client := NewFromGenerated(fake)
+
+	_, err := client.WriteFile(context.Background(), "s1", "out.txt", strings.NewReader("hello"), 5, false)
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("err=%v", err)
+	}
+	if !fake.writeStream.closed {
+		t.Fatal("expected CloseAndRecv after send error")
+	}
+}
+
+func TestWriteFileCancelsStreamOnReaderError(t *testing.T) {
+	readErr := errors.New("local read failed")
+	fake := &fakeGeneratedClient{}
+	client := NewFromGenerated(fake)
+
+	_, err := client.WriteFile(context.Background(), "s1", "out.txt", errorReader{err: readErr}, 0, false)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("err=%v", err)
+	}
+	if fake.writeCtx == nil {
+		t.Fatal("missing write context")
+	}
+	select {
+	case <-fake.writeCtx.Done():
+	default:
+		t.Fatal("stream context was not canceled")
 	}
 }
 
@@ -199,6 +229,8 @@ type fakeGeneratedClient struct {
 	readReq          *pb.ReadFileRequest
 	readChunks       [][]byte
 	writeStream      *fakeWriteFileStream
+	writeCtx         context.Context
+	writeSendErr     error
 	writeErr         error
 	mkdirReq         *pb.MkdirRequest
 	mkdirResp        *pb.MutationResponse
@@ -280,7 +312,8 @@ func (f *fakeGeneratedClient) ReadFile(ctx context.Context, in *pb.ReadFileReque
 }
 
 func (f *fakeGeneratedClient) WriteFile(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[pb.WriteFileRequest, pb.WriteFileResponse], error) {
-	f.writeStream = &fakeWriteFileStream{err: f.writeErr}
+	f.writeCtx = ctx
+	f.writeStream = &fakeWriteFileStream{sendErr: f.writeSendErr, err: f.writeErr}
 	return f.writeStream, nil
 }
 
@@ -333,12 +366,16 @@ func (s *fakeReadFileStream) Recv() (*pb.ReadFileChunk, error) {
 
 type fakeWriteFileStream struct {
 	fakeClientStream
-	sent   []*pb.WriteFileRequest
-	closed bool
-	err    error
+	sent    []*pb.WriteFileRequest
+	closed  bool
+	sendErr error
+	err     error
 }
 
 func (s *fakeWriteFileStream) Send(req *pb.WriteFileRequest) error {
+	if s.sendErr != nil {
+		return s.sendErr
+	}
 	s.sent = append(s.sent, req)
 	return nil
 }
@@ -363,3 +400,11 @@ func (fakeClientStream) CloseSend() error             { return nil }
 func (fakeClientStream) Context() context.Context     { return context.Background() }
 func (fakeClientStream) SendMsg(m any) error          { return nil }
 func (fakeClientStream) RecvMsg(m any) error          { return io.EOF }
+
+type errorReader struct {
+	err error
+}
+
+func (r errorReader) Read([]byte) (int, error) {
+	return 0, r.err
+}

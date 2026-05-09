@@ -6,10 +6,13 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
+
+const defaultDialTimeout = 5 * time.Second
 
 func TLSConfig(opts Options) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(opts.ClientCertFile, opts.ClientKeyFile)
@@ -45,7 +48,20 @@ func Dial(ctx context.Context, opts Options) (*grpc.ClientConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn, err := grpc.DialContext(ctx, opts.Addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+
+	dialCtx := ctx
+	cancel := func() {}
+	if _, ok := ctx.Deadline(); !ok {
+		dialCtx, cancel = context.WithTimeout(ctx, defaultDialTimeout)
+	}
+	defer cancel()
+
+	conn, err := grpc.DialContext(
+		dialCtx,
+		opts.Addr,
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+		grpc.WithReturnConnectionError(),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("dial sidecar %q: %w", opts.Addr, err)
 	}

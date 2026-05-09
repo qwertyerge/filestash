@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,6 +88,33 @@ func TestTLSConfigReportsInvalidInputs(t *testing.T) {
 				t.Fatalf("error %q does not contain %q", err.Error(), tt.want)
 			}
 		})
+	}
+}
+
+func TestDialReturnsErrorWhenSidecarUnavailable(t *testing.T) {
+	certs := writeClientCertBundle(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	conn, err := Dial(ctx, Options{
+		Addr:           addr,
+		ClientCertFile: certs.clientCert,
+		ClientKeyFile:  certs.clientKey,
+		CAFile:         certs.caCert,
+		ServerName:     "localhost",
+	})
+	if err == nil {
+		conn.Close()
+		t.Fatal("expected unavailable sidecar dial to fail")
 	}
 }
 
