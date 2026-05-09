@@ -42,6 +42,7 @@ const (
 
 type State struct {
 	Phase         Phase
+	SessionID     string
 	BackendType   string
 	Params        map[string]string
 	CurrentPath   string
