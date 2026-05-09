@@ -124,6 +124,21 @@ func TestMkdirPromptDispatchesMutationAndRefresh(t *testing.T) {
 	}
 }
 
+func TestShutdownClosesActiveSession(t *testing.T) {
+	fake := &fakeSidecar{}
+	model := NewModel(AppOptions{Client: fake})
+	model.State.SessionID = "s1"
+
+	model.Shutdown(context.Background())
+
+	if fake.closedSession != "s1" {
+		t.Fatalf("closed=%q", fake.closedSession)
+	}
+	if model.State.SessionID != "" {
+		t.Fatalf("session=%q", model.State.SessionID)
+	}
+}
+
 func updateWithKeys(t *testing.T, model Model, keys string) Model {
 	t.Helper()
 	for _, r := range keys {

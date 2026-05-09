@@ -10,6 +10,8 @@ func Run(ctx context.Context, opts AppOptions) error {
 	if opts.Context == nil {
 		opts.Context = ctx
 	}
-	_, err := tea.NewProgram(NewModel(opts), tea.WithContext(opts.Context)).Run()
+	model := NewModel(opts)
+	defer model.Shutdown(context.Background())
+	_, err := tea.NewProgram(model, tea.WithContext(opts.Context)).Run()
 	return err
 }

@@ -127,15 +127,22 @@ func discoverConfigCandidates(workDir string) []struct {
 		root string
 	}{
 		{
-			path: filepath.Join(workDir, "conf", "config.json"),
+			path: filepath.Join(workDir, "data", "state", "config", "config.json"),
 			root: workDir,
 		},
 		{
-			path: filepath.Join(workDir, "data", "state", "config", "config.json"),
+			path: filepath.Join(workDir, "conf", "config.json"),
 			root: workDir,
 		},
 	}
 	if filepath.Base(workDir) == "bin" {
+		candidates = append(candidates, struct {
+			path string
+			root string
+		}{
+			path: filepath.Join(filepath.Dir(workDir), "data", "state", "config", "config.json"),
+			root: filepath.Dir(workDir),
+		})
 		candidates = append(candidates, struct {
 			path string
 			root string

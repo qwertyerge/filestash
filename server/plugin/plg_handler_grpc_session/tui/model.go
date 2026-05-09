@@ -129,6 +129,18 @@ func (m Model) Init() tea.Cmd {
 	return nil
 }
 
+func (m *Model) Shutdown(ctx context.Context) {
+	if m == nil || m.Client == nil || m.State == nil || m.State.SessionID == "" {
+		return
+	}
+	sessionID := m.State.SessionID
+	if err := m.Client.Close(ctx, sessionID); err != nil {
+		m.State.Status = formatError("close", err)
+		return
+	}
+	m.State.SessionID = ""
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:

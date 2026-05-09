@@ -53,6 +53,35 @@ func TestResolveOptionsFindsPackageRootConfig(t *testing.T) {
 	}
 }
 
+func TestResolveOptionsPrefersRuntimeStateConfig(t *testing.T) {
+	root := t.TempDir()
+	writeTempFile(t, filepath.Join(root, "conf", "config.json"), `{
+  "features": {
+    "sidecar_grpc": {
+      "listen_addr": "127.0.0.1:9443"
+    }
+  }
+}`)
+	writeTempFile(t, filepath.Join(root, "data", "state", "config", "config.json"), `{
+  "features": {
+    "sidecar_grpc": {
+      "listen_addr": "127.0.0.1:9555"
+    }
+  }
+}`)
+
+	got, err := ResolveOptions(Options{WorkDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConfigFile != filepath.Join(root, "data", "state", "config", "config.json") {
+		t.Fatalf("ConfigFile=%q", got.ConfigFile)
+	}
+	if got.Addr != "127.0.0.1:9555" {
+		t.Fatalf("Addr=%q", got.Addr)
+	}
+}
+
 func TestResolveOptionsFindsConfigFromBinDirectory(t *testing.T) {
 	root := t.TempDir()
 	bin := filepath.Join(root, "bin")
